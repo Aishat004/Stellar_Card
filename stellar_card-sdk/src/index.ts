@@ -1,4 +1,6 @@
 export { Stellar_CardClient } from './client';
+export { ReconnectingStreamClient } from './streaming';
+export type { StreamingClientOptions, StreamMessage, ConnectionState } from './streaming';
 export type {
   OrderOptions,
   CreateOrderOptions,
@@ -18,6 +20,8 @@ export type {
   IterateOrdersOptions,
   ReportStatusOptions,
   StellarCardClientOptions,
+  AuditLogEntry,
+  ListAuditLogsOptions,
 } from './client';
 
 export {
@@ -97,6 +101,7 @@ export {
   payVCCOWS,
   saveWalletToKeystore,
   loadWalletFromKeystore,
+  zeroizeSecret,
   createKeystore,
   NodeFileSystemKeystore,
   BrowserKeystore,
@@ -153,10 +158,12 @@ export {
   extractContractErrorCode,
   computeFeeRefund,
   extractFeeMetricsFromHorizon,
+  fetchContractConfig,
   CONTRACT_ERROR_MESSAGES,
   CONTRACT_ERROR_MAP,
 } from './soroban';
 export type { ContractPaymentResult } from './types';
+export type { ContractConfig } from './soroban';
 
 export {
   createLogger,

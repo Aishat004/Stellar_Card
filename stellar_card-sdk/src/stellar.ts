@@ -31,9 +31,100 @@ export {
 } from './soroban';
 import type { ContractPaymentResult } from './types';
 import type { Logger } from './logger';
-import { InvalidMemoError } from './errors';
+import { InvalidMemoError, InvalidAmountError } from './errors';
 
 const USDC_ISSUER = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
+
+/**
+ * Convert stroops (1 XLM = 10^7 stroops) to a human-readable decimal string.
+ * Handles 7 decimal places and uses BigInt for precision.
+ *
+ * @param stroops - Stroops as a bigint, number, or numeric string
+ * @returns Decimal amount as a string with up to 7 decimal places (trailing zeros removed)
+ * @throws {InvalidAmountError} If stroops is negative or not a valid number
+ *
+ * @example
+ * ```typescript
+ * stroopsToDecimal(100_000_000n)  // "10.0"
+ * stroopsToDecimal(1n)             // "0.0000001"
+ * stroopsToDecimal(12_345_678n)   // "1.2345678"
+ * stroopsToDecimal(50_000_000)     // "5.0"
+ * ```
+ */
+export function stroopsToDecimal(stroops: bigint | number | string): string {
+  let amount: bigint;
+  try {
+    amount = typeof stroops === 'bigint' ? stroops : BigInt(stroops);
+  } catch {
+    throw new InvalidAmountError(`Invalid stroops amount: ${stroops}`);
+  }
+
+  if (amount < 0n) {
+    throw new InvalidAmountError(`Stroops amount must be non-negative: ${stroops}`);
+  }
+
+  const whole = amount / 10_000_000n;
+  const frac = amount % 10_000_000n;
+
+  if (frac === 0n) {
+    return whole.toString();
+  }
+
+  const fracStr = frac.toString().padStart(7, '0').replace(/0+$/, '');
+  return `${whole}.${fracStr}`;
+}
+
+/**
+ * Parse a currency string with optional symbol to decimal amount.
+ * Supports formats like "$10.50", "50 XLM", "100.00 USDC", and "42.5".
+ *
+ * @param input - Currency string with optional symbol or asset code
+ * @param defaultAsset - Default asset name if none specified in input (e.g., "XLM" or "USDC")
+ * @returns Parsed decimal amount as a string
+ * @throws {InvalidAmountError} If input cannot be parsed
+ *
+ * @example
+ * ```typescript
+ * parseCurrencyAmount("$10.50")        // "10.50"
+ * parseCurrencyAmount("100 XLM")       // "100"
+ * parseCurrencyAmount("50.5 USDC")     // "50.5"
+ * parseCurrencyAmount("42.5", "XLM")   // "42.5"
+ * ```
+ */
+export function parseCurrencyAmount(input: string, defaultAsset?: string): string {
+  if (typeof input !== 'string') {
+    throw new InvalidAmountError(`Input must be a string: ${input}`);
+  }
+
+  const trimmed = input.trim();
+  if (!trimmed) {
+    throw new InvalidAmountError('Currency amount cannot be empty');
+  }
+
+  // Remove common currency symbols
+  const withoutSymbol = trimmed.replace(/^[$€£¥₹₽₩₪₦]/, '').trim();
+
+  // Extract numeric part and optional asset code
+  const match = withoutSymbol.match(/^([\d.]+)\s*(XLM|USDC)?$/i);
+  if (!match) {
+    throw new InvalidAmountError(`Unable to parse currency amount: ${input}`);
+  }
+
+  const amountStr = match[1];
+  const assetCode = match[2];
+
+  // Validate numeric format
+  if (!/^\d+(\.\d+)?$/.test(amountStr)) {
+    throw new InvalidAmountError(`Invalid numeric format: ${amountStr}`);
+  }
+
+  // Check for negative
+  if (amountStr === '0' || amountStr.startsWith('-')) {
+    throw new InvalidAmountError(`Amount must be positive: ${amountStr}`);
+  }
+
+  return amountStr;
+}
 const HORIZON_TIMEOUT_MS = 15000;
 
 function getHorizonUrl(networkPassphrase?: string): string {
@@ -443,6 +534,8 @@ export interface PayOpts {
   networkPassphrase?: string;
   /** Custom Soroban RPC URL. Defaults to the public endpoint for the selected network. */
   sorobanRpcUrl?: string;
+  /** Fallback Soroban RPC URL used when the primary endpoint fails. */
+  fallbackRpcUrl?: string;
   /** Override the Horizon REST API URL. Defaults to the public endpoint for the selected network. */
   horizonUrl?: string;
   /** Optional logger instance */
@@ -492,6 +585,7 @@ export async function payViaContract(opts: PayOpts): Promise<ContractPaymentResu
     paymentAsset = 'usdc',
     networkPassphrase = Networks.PUBLIC,
     sorobanRpcUrl,
+    fallbackRpcUrl,
     horizonUrl,
     logger,
     baseFee,
@@ -518,44 +612,53 @@ export async function payViaContract(opts: PayOpts): Promise<ContractPaymentResu
     { orderId: payment.order_id, contractId: payment.contract_id, fn, amountDecimal },
   );
 
-  // Fee retry: if the network rejects the fee, rebuild with the
-  // required fee as the floor. At most one retry — the network's
-  // suggested fee should be sufficient on the second attempt.
-  let fee: string | undefined;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const { tx, server } = await buildContractPaymentTx({
-      contractId: payment.contract_id,
-      fn,
-      fromPublicKey: keypair.publicKey(),
-      amountStroops,
-      orderId: payment.order_id,
-      networkPassphrase,
-      rpcUrl: sorobanRpcUrl,
-      fee,
-      baseFee,
-    });
-    tx.sign(keypair);
-    try {
-      logger?.debug?.(`Submitting Soroban transaction (attempt ${attempt + 1}) to RPC`);
-      const result = await submitSorobanTx(tx, server, resolvedHorizonUrl, logger);
-      logger?.info?.(`Soroban transaction submitted successfully: ${result.hash}`);
-      return {
-        hash: result.hash,
-        feeCharged: result.feeCharged ?? result.maxFee ?? tx.fee,
-        feeRefunded: result.feeRefunded ?? '0',
-        maxFee: result.maxFee ?? tx.fee,
-      };
-    } catch (err) {
-      if (err instanceof InsufficientFeeError && attempt === 0) {
-        fee = err.requiredFee;
-        logger?.info?.(`Soroban transaction fee insufficient, bumping fee to ${fee} and retrying`);
-        continue;
+  // RPC failover: try the primary endpoint first, then the fallback when it
+  // is configured. Each endpoint gets its own fee-retry pass. When neither
+  // custom URL is given, a single `undefined` entry is used so
+  // `buildContractPaymentTx` resolves the network default.
+  const rpcEndpoints =
+    sorobanRpcUrl || fallbackRpcUrl
+      ? [sorobanRpcUrl, fallbackRpcUrl].filter((url): url is string => Boolean(url))
+      : [undefined];
+  let lastError: unknown;
+  for (const rpcUrl of rpcEndpoints) {
+    let fee: string | undefined;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const { tx, server } = await buildContractPaymentTx({
+        contractId: payment.contract_id,
+        fn,
+        fromPublicKey: keypair.publicKey(),
+        amountStroops,
+        orderId: payment.order_id,
+        networkPassphrase,
+        rpcUrl,
+        fee,
+        baseFee,
+      });
+      tx.sign(keypair);
+      try {
+        logger?.debug?.(`Submitting Soroban transaction (attempt ${attempt + 1}) to RPC`);
+        const result = await submitSorobanTx(tx, server, resolvedHorizonUrl, logger);
+        logger?.info?.(`Soroban transaction submitted successfully: ${result.hash}`);
+        return {
+          hash: result.hash,
+          feeCharged: result.feeCharged ?? result.maxFee ?? tx.fee,
+          feeRefunded: result.feeRefunded ?? '0',
+          maxFee: result.maxFee ?? tx.fee,
+        };
+      } catch (err) {
+        if (err instanceof InsufficientFeeError && attempt === 0) {
+          fee = err.requiredFee;
+          logger?.info?.(`Soroban transaction fee insufficient, bumping fee to ${fee} and retrying`);
+          continue;
+        }
+        lastError = err;
+        logger?.warn?.(`RPC endpoint ${String(rpcUrl) ?? 'default'} failed: ${String(err)}`);
+        break;
       }
-      logger?.error?.(`Soroban transaction submission failed: ${String(err)}`, { error: err });
-      throw err;
     }
   }
-  throw new Error('payViaContract: fee retry exhausted');
+  throw lastError ?? new Error('payViaContract: all RPC endpoints failed');
 }
 
 /**
@@ -594,6 +697,8 @@ export async function purchaseCard(opts: {
   baseUrl?: string;
   networkPassphrase?: string;
   sorobanRpcUrl?: string;
+  /** Fallback Soroban RPC URL used when the primary endpoint fails. */
+  fallbackRpcUrl?: string;
   /** Override the Horizon REST API URL used during contract submission. */
   horizonUrl?: string;
   resume?: { orderId: string; payment: PaymentInstructions };
@@ -626,6 +731,7 @@ export async function purchaseCard(opts: {
     paymentAsset,
     networkPassphrase: opts.networkPassphrase,
     sorobanRpcUrl: opts.sorobanRpcUrl,
+    fallbackRpcUrl: opts.fallbackRpcUrl,
     horizonUrl: opts.horizonUrl,
   });
 
@@ -800,6 +906,8 @@ export async function submitSignedTransaction(
     feeRefunded: result.feeRefunded ?? '0',
     maxFee: result.maxFee ?? String(tx.fee ?? BASE_FEE),
   };
+}
+
 // ── Transaction memo builder (#739) ──────────────────────────────────────────
 
 /** Supported {@link buildTransactionMemo} memo types. */
