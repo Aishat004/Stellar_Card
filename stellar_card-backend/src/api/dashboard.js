@@ -13,6 +13,7 @@ const { assertSafeUrl } = require('../lib/ssrf');
 const { recordDecision } = require('../policy');
 const { usdToXlm } = require('../payments/xlm-price');
 const requireAuth = require('../middleware/requireAuth');
+const { validateEventFilter } = require('../lib/webhook-filter');
 const requireDashboard = require('../middleware/requireDashboard');
 const { event: bizEvent } = require('../lib/logger');
 const { requirePermission } = require('../lib/permissions');
@@ -408,7 +409,8 @@ router.get('/api-keys', requirePermission('agent:read'), (req, res) => {
            policy_daily_limit_usdc, policy_single_tx_limit_usdc,
            policy_require_approval_above_usdc, policy_allowed_hours, policy_allowed_days,
            mode, rate_limit_rpm, expires_at,
-           agent_state, agent_state_at, agent_state_detail
+           agent_state, agent_state_at, agent_state_detail,
+           webhook_event_filter
     FROM api_keys WHERE dashboard_id = ? ORDER BY created_at DESC
   `,
       )
@@ -568,6 +570,7 @@ router.patch('/api-keys/:id', requirePermission('agent:update'), async (req, res
     policy_require_approval_above_usdc,
     policy_allowed_hours,
     policy_allowed_days,
+    webhook_event_filter,
   } = req.body;
   // Only sanitise label if the caller actually sent it — `undefined`
   // means "don't touch this field" and must pass through unchanged so
@@ -585,6 +588,12 @@ router.patch('/api-keys/:id', requirePermission('agent:update'), async (req, res
     policy_allowed_days,
   });
   if (validationErr) return res.status(400).json(validationErr);
+
+  if (webhook_event_filter !== undefined) {
+    const filterErr = validateEventFilter(webhook_event_filter);
+    if (filterErr) return res.status(400).json({ error: 'invalid_webhook_event_filter', message: filterErr });
+  }
+
   if (default_webhook_url) {
     try {
       await assertSafeUrl(default_webhook_url);
@@ -609,6 +618,14 @@ router.patch('/api-keys/:id', requirePermission('agent:update'), async (req, res
   if (policy_allowed_hours !== undefined)
     fields.policy_allowed_hours = policy_allowed_hours || null;
   if (policy_allowed_days !== undefined) fields.policy_allowed_days = policy_allowed_days || null;
+  if (webhook_event_filter !== undefined) {
+    // Null / '*' clears the filter (all events). An array is serialised to JSON.
+    if (webhook_event_filter === null || webhook_event_filter === '*') {
+      fields.webhook_event_filter = null;
+    } else {
+      fields.webhook_event_filter = JSON.stringify(webhook_event_filter);
+    }
+  }
 
   if (Object.keys(fields).length === 0) return res.status(400).json({ error: 'nothing_to_update' });
 
