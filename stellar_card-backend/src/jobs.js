@@ -7,6 +7,8 @@
 
 const db = require('./db');
 const logger = require('./lib/logger');
+const { recordAudit } = require('./lib/audit');
+const { withOpenedCard } = require('./lib/card-vault');
 const {
   fireWebhook,
   getWebhookMaxAttempts,
@@ -923,37 +925,78 @@ function expireApprovalRequests() {
   }
 }
 
-// Retention sweep — purge sealed card columns after delivered orders age
-// out. Adversarial audit F1: even sealed, the longer card data sits at
-// rest the larger the at-rest blast radius. vcc already does its own
-// retention sweep on the encrypted upstream copy; this is the stellar_card
-// mirror so both stores converge on "delete the PAN once the agent
-// no longer needs it from us".
-//
-// Default retention: 30 days. Tuned via CARD_RETENTION_DAYS. Card_brand
-// stays — it isn't sensitive and is useful for analytics.
-//
-// Adversarial audit F2-prune: filter on `card_number IS NOT NULL`
-// rather than `status = 'delivered'`. Today the vcc-callback flow
-// only ever writes card data on the delivered transition, so the
-// status filter is equivalent — but any future admin-override path
-// that leaves card data on a non-delivered row (e.g. a manual
-// refund post-delivery) would silently skip the purge and leak
-// PAN/CVV past its TTL. Filtering on the presence of card data
-// makes the privacy objective unambiguous.
-function purgeOldCards() {
-  const days = parseRetentionDays('CARD_RETENTION_DAYS', 30);
-  const result = db
+// PCI retention: card data is removed 90 days after the card's expiry month.
+// card_expiry is sealed, so inspect it through withOpenedCard; that helper
+// zeroizes the decrypted buffers immediately after the date check.
+const CARD_DATA_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+
+function isPastCardRetention(expiryBuffer, nowMs) {
+  if (!expiryBuffer) return false;
+  const match = expiryBuffer.toString('utf8').trim().match(/^(0[1-9]|1[0-2])\/(\d{2}|\d{4})$/);
+  if (!match) return false;
+
+  const month = Number(match[1]);
+  const year = match[2].length === 2 ? 2000 + Number(match[2]) : Number(match[2]);
+  const expiresAt = Date.UTC(year, month, 0, 23, 59, 59, 999);
+  return nowMs > expiresAt + CARD_DATA_RETENTION_MS;
+}
+
+async function purgeOldCards(now = new Date()) {
+  const rows = db
     .prepare(
-      `
-    UPDATE orders
-    SET card_number = NULL, card_cvv = NULL, card_expiry = NULL
-    WHERE card_number IS NOT NULL
-      AND datetime(updated_at) < datetime('now', ?)
-  `,
+      `SELECT id, card_number, card_cvv, card_expiry
+       FROM orders
+       WHERE card_number IS NOT NULL OR card_cvv IS NOT NULL OR card_expiry IS NOT NULL`,
     )
-    .run(`-${days} days`);
-  if (result.changes > 0) log(`purged card data on ${result.changes} order(s)`);
+    .all();
+  const nowMs = now.getTime();
+  const expiredRows = [];
+
+  for (const row of rows) {
+    const shouldPurge = await withOpenedCard(row, ({ expiry }) =>
+      isPastCardRetention(expiry, nowMs),
+    );
+    if (shouldPurge) expiredRows.push(row);
+  }
+
+  const updateCard = db.prepare(
+    `UPDATE orders
+     SET card_number = NULL, card_cvv = NULL, card_expiry = NULL
+     WHERE id = ? AND card_number IS ? AND card_cvv IS ? AND card_expiry IS ?`,
+  );
+  const countAudit = db.prepare(
+    `SELECT COUNT(*) AS n FROM audit_log
+     WHERE action = 'compliance.card_data_purged' AND resource_id = ?`,
+  );
+  const purgeAndAudit = db.transaction(() => {
+    let purged = 0;
+    for (const row of expiredRows) {
+      const result = updateCard.run(row.id, row.card_number, row.card_cvv, row.card_expiry);
+      if (result.changes === 0) continue;
+
+      const before = countAudit.get(row.id).n;
+      recordAudit({
+        dashboardId: 'system',
+        actor: { email: 'card-retention-job', role: 'system' },
+        action: 'compliance.card_data_purged',
+        resourceType: 'order',
+        resourceId: row.id,
+        details: {
+          retention_days: 90,
+          fields: ['card_number', 'card_cvv', 'card_expiry'],
+        },
+      });
+      if (countAudit.get(row.id).n !== before + 1) {
+        throw new Error(`card purge audit entry was not persisted for order ${row.id}`);
+      }
+      purged += 1;
+    }
+    return purged;
+  });
+
+  const purged = purgeAndAudit();
+  if (purged > 0) log(`purged expired card data on ${purged} order(s)`);
+  return purged;
 }
 
 // Clean up expired idempotency keys older than 24 hours
@@ -1046,9 +1089,8 @@ function prunePolicyDecisions() {
 //   - values over MAX_RETENTION_DAYS (defense against an env typo
 //     producing an astronomical value that flips the WHERE clause)
 // Invalid input logs a one-time warning and falls back to `defaultDays`.
-// This is the F1-prune fix: every retention knob is now safe under
-// misconfiguration instead of silently destroying card data or silently
-// not pruning at all.
+// This guards configurable retention jobs against destructive or disabled
+// pruning when an environment value is malformed.
 const MIN_RETENTION_DAYS = 1;
 const MAX_RETENTION_DAYS = 3650; // 10 years
 const _warnedRetentionKeys = new Set();
