@@ -433,3 +433,91 @@ describe('sentry-config — shouldReportError', () => {
     ]);
   });
 });
+
+// ── Breadcrumb helpers ────────────────────────────────────────────────────────
+
+describe('_sanitizeBreadcrumbUrl', () => {
+  it('strips the query string', () => {
+    const result = sentry._sanitizeBreadcrumbUrl('https://vcc.ctx.com/api/jobs?api_key=secret');
+    assert.ok(!result.includes('api_key'), 'query string must be stripped');
+    assert.ok(result.includes('/api/jobs'), 'path must be preserved');
+  });
+
+  it('redacts hex path segments ≥ 32 chars', () => {
+    const result = sentry._sanitizeBreadcrumbUrl(
+      'https://vcc.ctx.com/api/jobs/abcdef1234567890abcdef1234567890/paid',
+    );
+    assert.ok(!result.includes('abcdef1234567890abcdef1234567890'));
+    assert.ok(result.includes('[redacted]'));
+  });
+
+  it('redacts UUID path segments', () => {
+    const result = sentry._sanitizeBreadcrumbUrl(
+      'https://vcc.ctx.com/api/jobs/11111111-2222-3333-4444-555555555555/paid',
+    );
+    assert.ok(!result.includes('11111111-2222-3333-4444-555555555555'));
+    assert.ok(result.includes('[uuid]'));
+  });
+
+  it('handles a URL without a query string unchanged (except uuid redaction)', () => {
+    const result = sentry._sanitizeBreadcrumbUrl('https://vcc.ctx.com/api/register');
+    assert.equal(result, 'https://vcc.ctx.com/api/register');
+  });
+
+  it('returns [invalid-url] for non-string input', () => {
+    assert.equal(sentry._sanitizeBreadcrumbUrl(/** @type {any} */ (null)), '[invalid-url]');
+  });
+});
+
+describe('_classifyUrl', () => {
+  it('classifies VCC API calls', () => {
+    assert.equal(
+      sentry._classifyUrl('https://vcc.ctx.com/api/jobs/invoice'),
+      'http.vcc',
+    );
+  });
+
+  it('classifies Horizon calls', () => {
+    assert.equal(
+      sentry._classifyUrl('https://horizon-testnet.stellar.org/accounts/G123'),
+      'http.horizon',
+    );
+  });
+
+  it('classifies Soroban RPC calls as horizon', () => {
+    assert.equal(
+      sentry._classifyUrl('https://soroban-rpc.testnet.stellar.gateway.fm'),
+      'http.horizon',
+    );
+  });
+
+  it('classifies unknown URLs as external', () => {
+    assert.equal(sentry._classifyUrl('https://example.com/api'), 'http.external');
+  });
+});
+
+describe('_statusToLevel', () => {
+  it('maps 404 to debug (transient not-found)', () => {
+    assert.equal(sentry._statusToLevel(404), 'debug');
+  });
+
+  it('maps other 4xx to warning', () => {
+    assert.equal(sentry._statusToLevel(400), 'warning');
+    assert.equal(sentry._statusToLevel(422), 'warning');
+    assert.equal(sentry._statusToLevel(429), 'warning');
+  });
+
+  it('maps 5xx to error', () => {
+    assert.equal(sentry._statusToLevel(500), 'error');
+    assert.equal(sentry._statusToLevel(503), 'error');
+  });
+
+  it('maps 2xx to info', () => {
+    assert.equal(sentry._statusToLevel(200), 'info');
+    assert.equal(sentry._statusToLevel(201), 'info');
+  });
+
+  it('maps undefined (network failure) to error', () => {
+    assert.equal(sentry._statusToLevel(undefined), 'error');
+  });
+});
