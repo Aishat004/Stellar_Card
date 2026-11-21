@@ -1,44 +1,56 @@
 # Multi-stage build for stellar_card-backend.
 #
-#   builder — installs dependencies (native toolchain confined here)
-#   runner  — minimal production image, non-root, health-checked
-#   base    — kept for the root docker-compose.yml (`target: base`)
-#   dev     — hot-reload overlay for docker-compose.dev.yml
+#   deps       — full install (toolchain + all deps) for native-module compilation
+#   deps-prod  — production-only install (devDependencies excluded)
+#   builder    — copies source into the pruned production dependency tree
+#   runner     — minimal runtime image, non-root user, health-checked (<150 MB)
+#   base       — alias of deps kept for the root docker-compose.yml (`target: base`)
+#   dev        — hot-reload overlay for docker-compose.dev.yml
+#   test       — runs unit + integration suites; targeted by docker-compose.test.yml
 #
 # The default (final) stage is `runner`, so a bare
 # `docker build stellar_card-backend` produces the production artefact.
 
-# Stage 1: builder
-#
-# better-sqlite3 is a native module, so the toolchain has to be present when
-# `npm ci` runs. It is confined to this stage so the runtime image does not
-# ship a C compiler.
-FROM node:20-alpine AS builder
+# ── Stage 1: deps ────────────────────────────────────────────────────────────
+# Installs ALL dependencies so better-sqlite3 compiles against the
+# build toolchain.  The toolchain and devDependencies never reach the
+# final image.
+FROM node:20-alpine AS deps
 
 WORKDIR /app
 
-# Install build dependencies for native modules (e.g. better-sqlite3)
 RUN apk add --no-cache python3 make g++ sqlite-dev
 
-# Copy package descriptors
 COPY package*.json ./
-
-# Install all dependencies
 RUN npm ci
 
-# Copy application source code
+# ── Stage 2: deps-prod ───────────────────────────────────────────────────────
+# Re-installs with --omit=dev so the production image carries only the
+# packages listed under "dependencies".  A clean install in its own stage
+# (rather than `npm prune` on the full tree) produces a deterministic layer:
+# source changes never invalidate it.
+FROM node:20-alpine AS deps-prod
+
+WORKDIR /app
+
+RUN apk add --no-cache python3 make g++ sqlite-dev
+
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+# ── Stage 3: builder ─────────────────────────────────────────────────────────
+# Combines the pruned production modules with the application source.
+FROM deps-prod AS builder
+
 COPY src ./src
 COPY jsconfig.json ./
 
-# Create directory for SQLite database
 RUN mkdir -p /app/data
 
-# Stage 2: runner
-#
-# Minimal production image: only production dependencies, the application
-# source, and a non-root user. Runs as uid 10001 rather than the stock
-# `node` (1000) so the process is unprivileged and matches the deploy
-# policy documented in the security review.
+# ── Stage 4: runner ──────────────────────────────────────────────────────────
+# Minimal production image: no compiler, no devDependencies, non-root user.
+# Runs as uid 10001 so the process is unprivileged even if /etc/passwd is
+# modified in the host namespace.
 FROM node:20-alpine AS runner
 
 ENV NODE_ENV=production \
@@ -47,16 +59,18 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 
+# sqlite-libs: shared library required at runtime by better-sqlite3.
+# tini: PID-1 signal forwarding and zombie reaping.
 RUN apk add --no-cache sqlite-libs tini \
     && addgroup -g 10001 -S app \
-    && adduser -u 10001 -S app -G app \
+    && adduser  -u 10001 -S app -G app \
     && mkdir -p /app/data \
     && chown -R app:app /app
 
-COPY --from=builder /app/package*.json ./
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/src ./src
-COPY --from=builder /app/jsconfig.json ./
+COPY --from=builder --chown=app:app /app/package*.json ./
+COPY --from=builder --chown=app:app /app/node_modules  ./node_modules
+COPY --from=builder --chown=app:app /app/src            ./src
+COPY --from=builder --chown=app:app /app/jsconfig.json ./
 
 USER 10001
 
@@ -68,11 +82,15 @@ HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["node", "src/index.js"]
 
-# Stage 3: base
-#
-# Retained as an alias of the builder image so the root `docker-compose.yml`
-# (`target: base`) and any out-of-tree consumers keep working unchanged.
-FROM builder AS base
+# ── Stage 5: base ────────────────────────────────────────────────────────────
+# Retained so the root docker-compose.yml (`target: base`) and any
+# out-of-tree consumers continue working without changes.
+FROM deps AS base
+
+COPY src ./src
+COPY jsconfig.json ./
+
+RUN mkdir -p /app/data
 
 ENV NODE_ENV=production \
     PORT=4000 \
@@ -82,19 +100,33 @@ EXPOSE 4000
 
 CMD ["npm", "start"]
 
-# Stage 4: Development
+# ── Stage 6: dev ─────────────────────────────────────────────────────────────
+# Hot-reload overlay for docker-compose.dev.yml.  Relies on a bind mount
+# for src/ so an edit on the host restarts the server without a rebuild.
 #
-# Target this stage from docker-compose.dev.yml. It reuses the dependency
-# layer above, then relies on a bind mount for `src/`, so an edit on the host
-# restarts the server in the container without a rebuild.
-#
-# The CMD deliberately does not reuse the `dev` npm script: that script passes
-# `--env-file=.env`, and Node exits non-zero when that file is missing. Under
-# Compose the environment arrives from `environment:`/`env_file:` instead, and
-# a developer who has not created a local `.env` should still get a working
-# container.
+# Does not reuse the `dev` npm script because that script passes
+# `--env-file=.env`; Node exits non-zero when that file is absent.
+# Under Compose the environment is supplied via `environment:` / `env_file:`.
 FROM base AS dev
 
 ENV NODE_ENV=development
 
 CMD ["node", "--watch", "src/index.js"]
+
+# ── Stage 7: test ────────────────────────────────────────────────────────────
+# Runs the full test suite (unit + integration) inside the container.
+# Targeted by docker-compose.test.yml.  Uses the full dependency tree
+# from the `deps` stage so devDependencies (test runners, fixtures, etc.)
+# are available.
+FROM deps AS test
+
+COPY src    ./src
+COPY test   ./test
+COPY jsconfig.json ./
+
+RUN mkdir -p /app/data
+
+ENV NODE_ENV=test \
+    DB_PATH=/tmp/stellar_card_test.db
+
+CMD ["npm", "test"]
