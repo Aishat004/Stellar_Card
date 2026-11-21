@@ -10,7 +10,8 @@
     "format": "prettier --write \"src/**/*.js\" \"test/**/*.js\"",
     "format:check": "prettier --check \"src/**/*.js\" \"test/**/*.js\"",
     "typecheck": "tsc --project jsconfig.json",
-    "test": "node --test test/unit/*.test.js test/integration/*.test.js"
+    "test": "node --test test/unit/*.test.js test/integration/*.test.js",
+    "bench:db": "node tooling/bench-db.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.85.0",
