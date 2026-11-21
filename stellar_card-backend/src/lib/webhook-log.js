@@ -152,7 +152,85 @@ function safeParse(s) {
   }
 }
 
+/**
+ * Returns the webhook delivery success rate over the past `windowMs`
+ * milliseconds as a value in [0, 1], or `null` when there are no
+ * deliveries in the window (avoids a misleading 0).
+ *
+ * A delivery is considered successful when `response_status` is in the
+ * 2xx range; any row with a non-2xx status or a NULL status (transport
+ * failure / no response received) counts as a failure.
+ *
+ * @param {{ windowMs?: number }} [opts]
+ * @returns {number | null}
+ */
+function deliverySuccessRate24h(opts = {}) {
+  const windowMs = opts.windowMs ?? 24 * 60 * 60 * 1000;
+  const since = new Date(Date.now() - windowMs).toISOString();
+  const row = /** @type {any} */ (
+    db
+      .prepare(
+        `SELECT
+           COUNT(*) AS total,
+           SUM(CASE WHEN response_status >= 200 AND response_status < 300 THEN 1 ELSE 0 END) AS successes
+         FROM webhook_deliveries
+         WHERE created_at >= ?`,
+      )
+      .get(since)
+  );
+  if (!row || row.total === 0) return null;
+  return row.successes / row.total;
+}
+
+/**
+ * Returns p50 / p95 / p99 latency statistics (in ms) for webhook deliveries
+ * over the past `windowMs` milliseconds. Rows with NULL `latency_ms` are
+ * excluded from percentile calculations.
+ *
+ * Returns `null` for a percentile when there are no measurable deliveries.
+ *
+ * @param {{ windowMs?: number }} [opts]
+ * @returns {{ p50: number | null; p95: number | null; p99: number | null; count: number }}
+ */
+function deliveryLatencyStats24h(opts = {}) {
+  const windowMs = opts.windowMs ?? 24 * 60 * 60 * 1000;
+  const since = new Date(Date.now() - windowMs).toISOString();
+  const rows = /** @type {{ latency_ms: number }[]} */ (
+    db
+      .prepare(
+        `SELECT latency_ms
+         FROM webhook_deliveries
+         WHERE created_at >= ? AND latency_ms IS NOT NULL
+         ORDER BY latency_ms ASC`,
+      )
+      .all(since)
+  );
+  if (rows.length === 0) return { p50: null, p95: null, p99: null, count: 0 };
+  const values = rows.map((r) => r.latency_ms);
+  return {
+    p50: percentile(values, 50),
+    p95: percentile(values, 95),
+    p99: percentile(values, 99),
+    count: values.length,
+  };
+}
+
+/**
+ * Nearest-rank percentile on a pre-sorted array.
+ * @param {number[]} sorted - ascending-sorted numeric array (non-empty)
+ * @param {number} pct - percentile in [0, 100]
+ * @returns {number}
+ */
+function percentile(sorted, pct) {
+  const idx = Math.ceil((pct / 100) * sorted.length) - 1;
+  return sorted[Math.max(0, Math.min(idx, sorted.length - 1))];
+}
+
 module.exports = {
   recordWebhookDelivery,
   listDeliveries,
+  deliverySuccessRate24h,
+  deliveryLatencyStats24h,
+  /** @internal — exported for unit tests only */
+  _percentile: percentile,
 };
