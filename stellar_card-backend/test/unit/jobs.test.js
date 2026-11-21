@@ -354,40 +354,74 @@ describe('F1-reconcile: race with concurrent delivered flip in hard-fail branch'
 describe('purgeOldCards', () => {
   beforeEach(() => resetDb());
 
-  function seedDeliveredOrder({ daysAgo = 0 } = {}) {
+  function seedDeliveredOrder({ expiry = '12/25', status = 'delivered' } = {}) {
     const id = uuidv4();
-    const ts = new Date(Date.now() - daysAgo * 86_400_000)
-      .toISOString()
-      .replace('T', ' ')
-      .slice(0, 19);
     db.prepare(
       `
       INSERT INTO orders
         (id, status, amount_usdc, payment_asset, api_key_id, card_number, card_cvv, card_expiry, card_brand, created_at, updated_at)
-      VALUES (?, 'delivered', '10.00', 'usdc', NULL, '4111111111111111', '123', '12/28', 'Visa', ?, ?)
+      VALUES (?, ?, '10.00', 'usdc', 'merchant-key-id', '4111111111111111', '123', ?, 'Visa', datetime('now'), datetime('now'))
     `,
-    ).run(id, ts, ts);
+    ).run(id, status, expiry);
     return id;
   }
 
-  it('purges card_number/cvv/expiry on delivered orders older than the retention window', () => {
-    const oldId = seedDeliveredOrder({ daysAgo: 60 });
-    purgeOldCards();
+  it('purges card data over 90 days after expiry, audits it, and preserves accounting fields', async () => {
+    const oldId = seedDeliveredOrder({ expiry: '11/25', status: 'refunded' });
+    const purged = await purgeOldCards(new Date('2026-04-01T00:00:00.000Z'));
     const row = db
-      .prepare(`SELECT card_number, card_cvv, card_expiry, card_brand FROM orders WHERE id = ?`)
+      .prepare(
+        `SELECT id, status, amount_usdc, api_key_id, card_number, card_cvv, card_expiry, card_brand
+         FROM orders WHERE id = ?`,
+      )
       .get(oldId);
+    assert.equal(purged, 1);
+    assert.equal(row.id, oldId);
+    assert.equal(row.status, 'refunded');
+    assert.equal(row.amount_usdc, '10.00');
+    assert.equal(row.api_key_id, 'merchant-key-id');
     assert.equal(row.card_number, null);
     assert.equal(row.card_cvv, null);
     assert.equal(row.card_expiry, null);
-    // Brand stays — it's not sensitive and is useful for analytics.
     assert.equal(row.card_brand, 'Visa');
+
+    const audit = db
+      .prepare(
+        `SELECT action, resource_type, resource_id, details FROM audit_log
+         WHERE action = 'compliance.card_data_purged' AND resource_id = ?`,
+      )
+      .get(oldId);
+    assert.equal(audit.resource_type, 'order');
+    assert.equal(audit.resource_id, oldId);
+    assert.deepEqual(JSON.parse(audit.details), {
+      retention_days: 90,
+      fields: ['card_number', 'card_cvv', 'card_expiry'],
+    });
   });
 
-  it('keeps card data on delivered orders inside the retention window', () => {
-    const recentId = seedDeliveredOrder({ daysAgo: 5 });
-    purgeOldCards();
-    const row = db.prepare(`SELECT card_number FROM orders WHERE id = ?`).get(recentId);
-    assert.equal(row.card_number, '4111111111111111');
+  it('keeps card data until strictly more than 90 days after expiry', async () => {
+    const boundaryId = seedDeliveredOrder({ expiry: '12/25' });
+    const recentId = seedDeliveredOrder({ expiry: '01/26' });
+    const purged = await purgeOldCards(new Date('2026-03-31T23:59:59.999Z'));
+
+    assert.equal(purged, 0);
+    for (const id of [boundaryId, recentId]) {
+      const row = db.prepare(`SELECT card_cvv, card_expiry FROM orders WHERE id = ?`).get(id);
+      assert.equal(row.card_cvv, '123');
+      assert.notEqual(row.card_expiry, null);
+    }
+  });
+
+  it('leaves cards with missing or malformed expiry untouched', async () => {
+    const missingId = seedDeliveredOrder({ expiry: null });
+    const malformedId = seedDeliveredOrder({ expiry: 'not-an-expiry' });
+    await purgeOldCards(new Date('2035-01-01T00:00:00.000Z'));
+
+    for (const id of [missingId, malformedId]) {
+      const row = db.prepare(`SELECT card_cvv, card_expiry FROM orders WHERE id = ?`).get(id);
+      assert.equal(row.card_cvv, '123');
+      assert.notEqual(row.card_expiry, null);
+    }
   });
 });
 
