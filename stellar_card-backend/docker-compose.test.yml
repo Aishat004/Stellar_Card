@@ -1,0 +1,46 @@
+# stellar_card-backend — containerised test runner.
+#
+# Runs the full unit + integration test suite inside a dedicated Docker
+# container built from the `test` stage of the multi-stage Dockerfile.
+# devDependencies are present in this image so the Node test runner and
+# all test helpers are available.
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml run --rm tests
+#
+# Exit code mirrors the test-runner exit code, so this is CI-safe:
+#   0 = all tests passed
+#   non-zero = at least one test failed
+#
+# The SQLite database lives in a tmpfs volume so each run starts with a
+# clean state without touching the host filesystem.
+
+services:
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+      # Cache the dependency layer aggressively: package-lock.json changes
+      # bust only the npm ci layer, not the source copy.
+      cache_from:
+        - type=local,src=/tmp/.buildx-cache
+      cache_to:
+        - type=local,dest=/tmp/.buildx-cache,mode=max
+    image: stellar_card-backend:test
+    container_name: stellar_card-tests
+    environment:
+      NODE_ENV: test
+      DB_PATH: /tmp/stellar_card_test.db
+      # Suppress any telemetry or external calls during tests.
+      STELLAR_CARD_DISABLE_TELEMETRY: "1"
+    # tmpfs keeps the in-container SQLite file off the host and guarantees
+    # a fresh database on every `docker compose run`.
+    tmpfs:
+      - /tmp
+    # Tests are CPU-bound; no network services needed.
+    network_mode: none
+    # Remove the container automatically after the run completes.
+    # Override with `--no-rm` if you need to inspect logs after a failure.
+    profiles: []
+    restart: "no"
