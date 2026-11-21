@@ -360,7 +360,7 @@ router.post('/', webhookSignaturePrecheck, (req, res) => {
     const keyRow = /** @type {any} */ (
       order.api_key_id
         ? db
-            .prepare(`SELECT webhook_secret, default_webhook_url FROM api_keys WHERE id = ?`)
+            .prepare(`SELECT webhook_secret, default_webhook_url, webhook_event_filter FROM api_keys WHERE id = ?`)
             .get(order.api_key_id)
         : null
     );
@@ -385,6 +385,7 @@ router.post('/', webhookSignaturePrecheck, (req, res) => {
           },
         },
         keyRow?.webhook_secret || null,
+        keyRow?.webhook_event_filter ?? null,
       ).catch(() => {});
     }
   } else if (status === 'failed') {
@@ -458,7 +459,7 @@ router.post('/', webhookSignaturePrecheck, (req, res) => {
       db
         .prepare(
           `
-      SELECT o.webhook_url, k.webhook_secret, k.default_webhook_url
+      SELECT o.webhook_url, k.webhook_secret, k.default_webhook_url, k.webhook_event_filter
       FROM orders o LEFT JOIN api_keys k ON o.api_key_id = k.id
       WHERE o.id = ?
     `,
@@ -485,6 +486,7 @@ router.post('/', webhookSignaturePrecheck, (req, res) => {
           error_code: safeCode,
         },
         failedOrder?.webhook_secret || null,
+        failedOrder?.webhook_event_filter ?? null,
       ).catch(() => {});
     }
 

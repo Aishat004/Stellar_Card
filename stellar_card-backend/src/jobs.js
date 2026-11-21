@@ -247,7 +247,7 @@ async function expireStaleOrders() {
     db
       .prepare(
         `
-    SELECT o.*, k.webhook_secret, k.default_webhook_url
+    SELECT o.*, k.webhook_secret, k.default_webhook_url, k.webhook_event_filter
     FROM orders o
     LEFT JOIN api_keys k ON o.api_key_id = k.id
     WHERE o.status = 'expired' AND o.updated_at = ?
@@ -271,6 +271,7 @@ async function expireStaleOrders() {
           note: 'Payment window expired. No funds were taken.',
         },
         order.webhook_secret || null,
+        order.webhook_event_filter ?? null,
       ).catch(() => {});
     }
   }

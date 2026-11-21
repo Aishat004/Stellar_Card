@@ -1123,6 +1123,22 @@ function explainListOrdersPlan(opts = {}) {
   return db.prepare(`EXPLAIN QUERY PLAN ${query}`).all(...params);
 }
 
+// Migration 32: webhook event subscription filter per api key.
+//
+// Agents may now subscribe only to specific event types (e.g. only
+// order.fulfilled and order.failed) instead of receiving all events.
+// The column stores a JSON array of event-type strings, or NULL / '*'
+// to mean "all events" (the previous and default behaviour).
+applyMigration(32, () => {
+  try {
+    db.prepare(
+      `ALTER TABLE api_keys ADD COLUMN webhook_event_filter TEXT`,
+    ).run();
+  } catch (e) {
+    if (!e.message.includes('duplicate column')) throw e;
+  }
+});
+
 // Attach helpers to db instance for export (Part 3)
 db.listOrders = listOrders;
 db.explainListOrdersPlan = explainListOrdersPlan;

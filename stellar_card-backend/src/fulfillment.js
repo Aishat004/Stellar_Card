@@ -8,6 +8,7 @@ const db = require('./db');
 const { assertSafeUrl } = require('./lib/ssrf');
 const { sendUsdc, sendXlm } = require('./payments/xlm-sender');
 const { event: bizEvent, log } = require('./lib/logger');
+const { parseFilter, shouldDispatch } = require('./lib/webhook-filter');
 
 function isFrozen() {
   return (
@@ -525,7 +526,18 @@ async function fireWebhook(url, payload, webhookSecret, _log, context = {}) {
 // Now: inner try/catch around the INSERT, emit a loud bizEvent on
 // failure so alerting pipelines see it, still swallow after logging
 // so the surrounding order flow still commits.
-async function enqueueWebhook(url, payload, webhookSecret) {
+/**
+ * @param {string} url
+ * @param {Record<string, unknown>} payload
+ * @param {string | null} webhookSecret
+ * @param {unknown} [rawEventFilter] — raw `webhook_event_filter` from the api_keys row
+ */
+async function enqueueWebhook(url, payload, webhookSecret, rawEventFilter) {
+  const filter = parseFilter(rawEventFilter ?? null);
+  if (!shouldDispatch(payload, filter)) {
+    return; // event type not in subscriber's allowlist — skip silently
+  }
+
   let deliveryErr;
   try {
     await fireWebhook(url, payload, webhookSecret, null);
