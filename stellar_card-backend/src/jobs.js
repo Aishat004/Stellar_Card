@@ -5,6 +5,9 @@
 // evaluator) are also mirrored to Sentry via reportSchedulerError below —
 // see the comment on _reportError for why that hook exists.
 
+const fs = require('fs');
+const path = require('path');
+const zlib = require('zlib');
 const db = require('./db');
 const logger = require('./lib/logger');
 const { recordAudit } = require('./lib/audit');
@@ -1368,6 +1371,98 @@ async function checkAgentFundingStatusGuarded() {
   }
 }
 
+// ── Database backup (#993) ────────────────────────────────────────────────────
+
+const BACKUP_DIR = process.env.BACKUP_DIR || path.join(process.cwd(), 'backups');
+const BACKUP_RETENTION_DAYS = 14;
+const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 h
+
+/**
+ * Create a timestamped Gzip-compressed snapshot of the SQLite database.
+ * Uses better-sqlite3's non-blocking .backup() API so reads/writes on the
+ * main connection continue while the snapshot is taken. The raw snapshot is
+ * piped through zlib.createGzip() and written to
+ * backups/db-backup-YYYY-MM-DD.sqlite.gz.
+ *
+ * Returns the path of the archive on success, throws on any I/O failure.
+ */
+async function backupDatabase() {
+  fs.mkdirSync(BACKUP_DIR, { recursive: true });
+
+  const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const tmpPath = path.join(BACKUP_DIR, `db-backup-${date}.sqlite.tmp`);
+  const gzPath = path.join(BACKUP_DIR, `db-backup-${date}.sqlite.gz`);
+
+  // Non-blocking online snapshot via better-sqlite3.
+  await db.backup(tmpPath);
+
+  // Compress the snapshot and remove the uncompressed temp file.
+  await new Promise((resolve, reject) => {
+    const src = fs.createReadStream(tmpPath);
+    const dst = fs.createWriteStream(gzPath);
+    const gz = zlib.createGzip();
+    src.on('error', reject);
+    gz.on('error', reject);
+    dst.on('error', reject);
+    dst.on('finish', resolve);
+    src.pipe(gz).pipe(dst);
+  });
+
+  fs.unlinkSync(tmpPath);
+  return gzPath;
+}
+
+/**
+ * Remove backup archives older than BACKUP_RETENTION_DAYS from BACKUP_DIR.
+ * Returns the list of pruned file paths.
+ */
+function pruneOldBackups() {
+  if (!fs.existsSync(BACKUP_DIR)) return [];
+
+  const cutoff = Date.now() - BACKUP_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const pruned = [];
+
+  for (const file of fs.readdirSync(BACKUP_DIR)) {
+    if (!file.startsWith('db-backup-') || !file.endsWith('.sqlite.gz')) continue;
+    const full = path.join(BACKUP_DIR, file);
+    try {
+      const { mtimeMs } = fs.statSync(full);
+      if (mtimeMs < cutoff) {
+        fs.unlinkSync(full);
+        pruned.push(full);
+      }
+    } catch {
+      // File may have been removed concurrently — ignore.
+    }
+  }
+
+  return pruned;
+}
+
+/**
+ * Guarded wrapper run on the daily backup interval. Never throws so a single
+ * backup failure cannot crash the job loop.
+ */
+async function runDatabaseBackup() {
+  try {
+    const archive = await backupDatabase();
+    log(`db backup created: ${archive}`);
+  } catch (err) {
+    log(`db backup failed: ${err instanceof Error ? err.message : String(err)}`);
+    reportSchedulerError(err, 'databaseBackup');
+  }
+
+  try {
+    const pruned = pruneOldBackups();
+    if (pruned.length > 0) log(`db backup pruned ${pruned.length} old archive(s)`);
+  } catch (err) {
+    log(`db backup prune failed: ${err instanceof Error ? err.message : String(err)}`);
+    reportSchedulerError(err, 'databaseBackupPrune');
+  }
+}
+
+// ── Interval registry ─────────────────────────────────────────────────────────
+
 // Track every interval scheduled by startJobs() so the process
 // signal handler in index.js can cancel them cleanly on SIGINT /
 // SIGTERM. Without this, pm2's graceful-stop sent SIGINT, Node
@@ -1405,6 +1500,10 @@ function startJobs() {
       ALERT_INTERVAL_MS,
     ),
   );
+
+  // Daily database backup (#993). Runs immediately on startup then every 24 h.
+  runDatabaseBackup();
+  _jobIntervals.push(setInterval(() => { runDatabaseBackup(); }, BACKUP_INTERVAL_MS));
 
   log('background jobs started');
 }
@@ -1478,6 +1577,9 @@ module.exports = {
   _checkAgentFundingStatusGuarded: checkAgentFundingStatusGuarded,
   _onAlertsError: onAlertsError,
   runJobs,
+  backupDatabase,
+  pruneOldBackups,
+  runDatabaseBackup,
   checkAgentFundingStatus,
   _resetFundingHorizonOutageState,
   _horizonBase: horizonBase,
