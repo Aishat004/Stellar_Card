@@ -46,22 +46,6 @@ const { captureException } = require('../lib/sentry-config');
  * @param {import('express').Response} res
  * @param {import('express').NextFunction} next
  */
-function errorHandler(err, req, res, _next) {
-  if (res.headersSent) {
-    return _next(err);
-  }
-
-  // CORS structured denial from the cors() middleware.
-  if (err && err.message && typeof err.message === 'string' && err.message.startsWith('CORS:')) {
-    return res.status(403).json({ error: 'forbidden', message: 'Origin not allowed' });
-  }
-
-  // Handle explicit 4xx client errors (e.g. body-parser SyntaxError 400 or PayloadTooLargeError 413)
-  const status = Number(err?.status || err?.statusCode);
-  if (status >= 400 && status < 500) {
-    return res.status(status).json({
-      error: err?.type || 'bad_request',
-      message: err?.message || 'The request could not be processed.',
 function errorHandler(err, req, res, next) {
   // Once the response has started, writing again would throw
   // ERR_HTTP_HEADERS_SENT. Delegate to Express's built-in default.
@@ -80,6 +64,13 @@ function errorHandler(err, req, res, next) {
   // Anything outside it still falls through to the generic 500 below.
   const status = Number(err && (err.status || err.statusCode));
   if (status >= 400 && status < 500) {
+    // 413 Payload Too Large: set Connection: close so the TCP keep-alive
+    // session is torn down immediately. This prevents a misbehaving client
+    // from streaming another oversized body on the same connection before
+    // the server has a chance to enforce the limit again.
+    if (status === 413) {
+      res.set('Connection', 'close');
+    }
     return res.status(status).json({
       error: (err && err.type) || 'bad_request',
       message: (err && err.message) || 'The request could not be processed.',
