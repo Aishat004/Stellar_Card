@@ -453,6 +453,121 @@ function sentryErrorHandler() {
   return Sentry.Handlers.errorHandler({ shouldHandleError: shouldReportError });
 }
 
+// ── HTTP breadcrumb helpers ───────────────────────────────────────────────────
+//
+// Sentry's Node SDK auto-instruments the built-in `http` module and records
+// outbound requests as breadcrumbs automatically.  The helpers below add an
+// explicit, structured breadcrumb for VCC API calls and Stellar Horizon RPC
+// requests so each has a consistent shape, predictable PII scrubbing, and an
+// accurate duration field that the auto-instrumentation does not always
+// capture.
+//
+// Suppression rules (issue #1009):
+//   - 404 responses from external upstreams are transient "not found" results,
+//     not actionable errors — they are downgraded to "debug" level so they do
+//     not add noise to the breadcrumb trail.
+//   - 4xx responses in general are client-side validation failures that the
+//     caller already handles; they are recorded at "warning" rather than
+//     "error" level.
+
+// URL prefixes that classify a request as a VCC API call or a Horizon call.
+// Used by addHttpBreadcrumb to set the breadcrumb category.
+const VCC_API_PREFIX = process.env.VCC_API_BASE || 'https://vcc.ctx.com';
+const HORIZON_PREFIXES = ['https://horizon', 'https://soroban-rpc'];
+
+/**
+ * Redact a URL for breadcrumb recording: strip the query string (may carry
+ * tokens or keys) and redact any path segment that looks like a secret
+ * (hex strings ≥ 32 chars, UUIDs, JWT fragments).
+ *
+ * The path itself is kept so the breadcrumb is useful for routing triage.
+ *
+ * @param {string} url
+ * @returns {string}
+ */
+function sanitizeBreadcrumbUrl(url) {
+  if (typeof url !== 'string') return '[invalid-url]';
+  let clean;
+  try {
+    const parsed = new URL(url);
+    // Strip query string — may carry api_key, token, etc.
+    parsed.search = '';
+    clean = parsed.toString();
+  } catch {
+    // Not a fully-qualified URL — strip from '?' onward.
+    const q = url.indexOf('?');
+    clean = q === -1 ? url : url.slice(0, q);
+  }
+  // Redact path segments that look like secrets (hex ≥ 32 chars, UUIDs).
+  return clean.replace(/\/[0-9a-f]{32,}/gi, '/[redacted]').replace(
+    /\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
+    '/[uuid]',
+  );
+}
+
+/**
+ * Classify the breadcrumb category from the request URL.
+ *
+ * @param {string} url
+ * @returns {'http.vcc' | 'http.horizon' | 'http.external'}
+ */
+function classifyUrl(url) {
+  if (typeof url === 'string' && url.startsWith(VCC_API_PREFIX)) return 'http.vcc';
+  if (typeof url === 'string' && HORIZON_PREFIXES.some((p) => url.startsWith(p)))
+    return 'http.horizon';
+  return 'http.external';
+}
+
+/**
+ * Map an HTTP status code to a Sentry breadcrumb level.
+ *
+ * 404 and 4xx are expected/transient; 5xx and network failures are errors.
+ *
+ * @param {number | undefined} status
+ * @returns {'debug' | 'info' | 'warning' | 'error'}
+ */
+function statusToLevel(status) {
+  if (status === undefined || status === null) return 'error'; // network failure
+  if (status === 404) return 'debug';
+  if (status >= 400 && status < 500) return 'warning';
+  if (status >= 500) return 'error';
+  return 'info';
+}
+
+/**
+ * Record a structured Sentry breadcrumb for an outbound HTTP call.
+ *
+ * Call this after the fetch/response resolves:
+ *
+ *   const start = Date.now();
+ *   const res = await fetch(url, opts);
+ *   addHttpBreadcrumb({ method: 'POST', url, status: res.status, startMs: start });
+ *
+ * @param {object} opts
+ * @param {string}  opts.method   HTTP verb (GET, POST, …)
+ * @param {string}  opts.url      Full request URL (query string will be stripped)
+ * @param {number}  [opts.status] HTTP response status code (omit on network failure)
+ * @param {number}  [opts.startMs] `Date.now()` value captured before the call; used to compute duration
+ * @param {Record<string, unknown>} [opts.extra] Additional fields (will be PII-scrubbed)
+ */
+function addHttpBreadcrumb({ method, url, status, startMs, extra = {} }) {
+  if (!initialized) return;
+  const durationMs = startMs !== undefined ? Date.now() - startMs : undefined;
+  const level = statusToLevel(status);
+  Sentry.addBreadcrumb({
+    type: 'http',
+    category: classifyUrl(url),
+    level,
+    data: redactDeep({
+      method: (method || 'GET').toUpperCase(),
+      url: sanitizeBreadcrumbUrl(url),
+      status_code: status,
+      duration_ms: durationMs,
+      ...extra,
+    }),
+  });
+}
+
 module.exports = {
   Sentry,
   initSentry,
@@ -465,6 +580,7 @@ module.exports = {
   flush,
   sentryRequestHandler,
   sentryErrorHandler,
+  addHttpBreadcrumb,
   // Internal — exported so the scrubbing rules and option construction
   // can be unit-tested without a live transport. Not part of the module's
   // public surface.
@@ -473,4 +589,7 @@ module.exports = {
   _shouldReportError: shouldReportError,
   _buildSentryOptions: buildSentryOptions,
   _DSN_SHAPE: DSN_SHAPE,
+  _sanitizeBreadcrumbUrl: sanitizeBreadcrumbUrl,
+  _classifyUrl: classifyUrl,
+  _statusToLevel: statusToLevel,
 };
