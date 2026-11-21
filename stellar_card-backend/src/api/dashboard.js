@@ -10,6 +10,7 @@ const bcrypt = require('bcryptjs');
 /** @type {any} */ const db = require('../db');
 const { enqueueWebhook, fireWebhook: fireWebhookRaw } = require('../fulfillment');
 const { assertSafeUrl } = require('../lib/ssrf');
+const { generateApiKey, extractKeyPrefix } = require('../lib/api-key');
 const { recordDecision } = require('../policy');
 const { usdToXlm } = require('../payments/xlm-price');
 const requireAuth = require('../middleware/requireAuth');
@@ -448,8 +449,11 @@ router.post('/api-keys', requirePermission('agent:create'), async (req, res) => 
   }
 
   const id = uuidv4();
-  const rawKey = `stellar_card_${crypto.randomBytes(24).toString('hex')}`;
-  const keyPrefix = rawKey.slice(9, 21);
+  // Use the v2 sk_{env}_{payload}{checksum} format so the middleware can
+  // reject corrupted keys via CRC32 before any DB or bcrypt work.
+  const keyMode = /** @type {'live' | 'test'} */ (req.body?.mode === 'test' ? 'test' : 'live');
+  const rawKey = generateApiKey(keyMode);
+  const keyPrefix = extractKeyPrefix(rawKey);
   const keyHash = await bcrypt.hash(rawKey, 10);
   const webhookSecret = `whsec_${crypto.randomBytes(32).toString('hex')}`;
 
