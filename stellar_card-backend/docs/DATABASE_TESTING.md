@@ -78,6 +78,19 @@ Temporary databases are created under `os.tmpdir()` via `fs.mkdtemp` and
 removed in an `after` hook — WAL leaves `-wal` and `-shm` siblings, so
 the whole directory is removed rather than the single file.
 
+## Write-throughput benchmark
+
+Run `npm run bench:db` from `stellar_card-backend` to exercise 1,000 concurrent
+order state transitions using eight worker threads. The benchmark initializes
+the production schema in an isolated temporary file, verifies WAL mode, and
+prints Node.js/SQLite versions, duration, transactions per second (TPS), error
+rate, and `SQLITE_BUSY` count. It exits unsuccessfully if any transition fails,
+any lock error occurs, or the final delivered-row count is wrong. Include the
+emitted report in the pull request; throughput is hardware-dependent.
+
+`--writes` and `--workers` can adjust the workload:
+`npm run bench:db -- --writes 1000 --workers 8`.
+
 ## Adding a migration
 
 When you add `applyMigration(N, ...)` to `src/db.js`:

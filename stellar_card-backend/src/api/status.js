@@ -12,6 +12,7 @@ const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const db = require('../db');
 const { openSSEStreamCount } = require('./orders');
 const { MAX_WEBHOOK_ATTEMPTS: MAX_WEBHOOK_ATTEMPTS_FOR_STATUS } = require('../fulfillment');
+const { deliverySuccessRate24h, deliveryLatencyStats24h } = require('../lib/webhook-log');
 
 const router = Router();
 
@@ -183,6 +184,8 @@ router.get('/status', statusLimiter, (req, res) => {
     },
     webhooks: {
       failed_permanent_24h: webhooksFailedPermanent24h,
+      delivery_success_rate_24h: deliverySuccessRate24h(),
+      delivery_latency_ms_24h: deliveryLatencyStats24h(),
     },
     sse: openSSEStreamCount(),
     process: {

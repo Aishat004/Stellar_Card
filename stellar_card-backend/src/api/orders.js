@@ -18,6 +18,7 @@ const {
   orderIdParam,
 } = require('../lib/validate');
 const db = require('../db');
+const { decodeCursor, slicePage } = require('../lib/cursor-pagination');
 const { isFrozen } = require('../fulfillment');
 const { assertSafeUrl } = require('../lib/ssrf');
 const { checkPolicy, recordDecision } = require('../policy');
@@ -197,8 +198,12 @@ const ListOrdersQuery = z
     since_updated_at: optionalIsoTimestamp(
       'since_updated_at must be an ISO-8601 timestamp (e.g. 2026-04-16T00:00:00.000Z)',
     ),
-    limit: boundedIntQuery({ default: 20, min: 1, max: 200 }),
+    limit: boundedIntQuery({ default: 20, min: 1, max: 100 }),
     offset: boundedIntQuery({ default: 0, min: 0, max: Number.MAX_SAFE_INTEGER }),
+    starting_after: z
+      .string()
+      .optional()
+      .transform((v) => (v === '' ? undefined : v)),
   })
   .passthrough();
 
@@ -839,7 +844,28 @@ router.post('/', orderCreateLimiter, validateCreateOrder, async (req, res) => {
 // lexically against an ISO column, silently matching everything or
 // nothing.
 router.get('/', orderPollLimiter, validateListOrders, (req, res) => {
-  const { status, limit, offset, since_created_at, since_updated_at } = req.query;
+  const { status, limit, offset, since_created_at, since_updated_at, starting_after } = req.query;
+
+  if (starting_after !== undefined) {
+    // Cursor path: keyset pagination — O(log N + limit) regardless of depth.
+    const anchor = decodeCursor(/** @type {string} */ (starting_after));
+    if (starting_after && !anchor) {
+      return res
+        .status(400)
+        .json({ error: 'invalid_cursor', message: 'starting_after is not a valid cursor' });
+    }
+    const rows = db.listOrdersCursor({
+      apiKeyId: req.apiKey.id,
+      status: /** @type {string | undefined} */ (status),
+      sinceCreatedAt: /** @type {string | undefined} */ (since_created_at),
+      sinceUpdatedAt: /** @type {string | undefined} */ (since_updated_at),
+      limit: /** @type {number} */ (limit) + 1,
+      startingAfter: anchor,
+    });
+    return res.json(slicePage(rows, /** @type {number} */ (limit)));
+  }
+
+  // Legacy OFFSET path: preserved for backward compatibility with existing clients.
   const orders = db.listOrders({
     apiKeyId: req.apiKey.id,
     status,
