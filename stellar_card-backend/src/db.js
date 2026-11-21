@@ -1123,8 +1123,64 @@ function explainListOrdersPlan(opts = {}) {
   return db.prepare(`EXPLAIN QUERY PLAN ${query}`).all(...params);
 }
 
+/**
+ * Cursor-based (keyset) variant of listOrders.  Accepts an optional
+ * `startingAfter` decoded cursor ({ created_at, id }) that anchors the query
+ * to the last-seen row, returning the next page in O(log N + limit) time
+ * regardless of page depth.
+ *
+ * Callers should request `limit + 1` rows and use the cursor-pagination
+ * slicePage() helper to derive `has_more` and `next_cursor`.
+ *
+ * @param {Object} opts
+ * @param {string} opts.apiKeyId
+ * @param {string} [opts.status]
+ * @param {string} [opts.sinceCreatedAt]
+ * @param {string} [opts.sinceUpdatedAt]
+ * @param {number} [opts.limit=20]
+ * @param {{ created_at: string; id: string } | null} [opts.startingAfter]
+ * @returns {Array<Object>}
+ */
+function listOrdersCursor({
+  apiKeyId,
+  status,
+  sinceCreatedAt,
+  sinceUpdatedAt,
+  limit = 20,
+  startingAfter = null,
+} = {}) {
+  if (!apiKeyId) throw new TypeError('listOrdersCursor: apiKeyId is required');
+  const safeLimit = Math.min(Math.max(1, Number(limit) || 20), 201); // callers pass limit+1
+
+  let query = `SELECT id, status, amount_usdc, payment_asset, created_at, updated_at FROM orders WHERE api_key_id = ?`;
+  const params = [apiKeyId];
+
+  if (status) {
+    query += ` AND status = ?`;
+    params.push(status);
+  }
+  if (sinceCreatedAt) {
+    query += ` AND created_at >= ?`;
+    params.push(sinceCreatedAt);
+  }
+  if (sinceUpdatedAt) {
+    query += ` AND updated_at >= ?`;
+    params.push(sinceUpdatedAt);
+  }
+  if (startingAfter) {
+    query += ` AND (created_at < ? OR (created_at = ? AND id < ?))`;
+    params.push(startingAfter.created_at, startingAfter.created_at, startingAfter.id);
+  }
+
+  query += ` ORDER BY created_at DESC, id DESC LIMIT ?`;
+  params.push(safeLimit);
+
+  return db.prepare(query).all(...params);
+}
+
 // Attach helpers to db instance for export (Part 3)
 db.listOrders = listOrders;
+db.listOrdersCursor = listOrdersCursor;
 db.explainListOrdersPlan = explainListOrdersPlan;
 
 module.exports = db;
