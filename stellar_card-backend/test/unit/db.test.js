@@ -1338,6 +1338,82 @@ describe('db.js — order list query plan', () => {
   });
 });
 
+// ── Migration 32 — foreign key pragma enforcement (issue #994) ────────────────
+//
+// These tests verify that:
+//   1. foreign_keys = ON is active on the shared test connection.
+//   2. orders.api_key_id rejects rows that reference a non-existent api_key.
+//   3. idempotency_keys rows are cascade-deleted when their api_key is deleted.
+
+describe('db.js — migration 32: foreign key constraint enforcement', () => {
+  beforeEach(() => resetDb());
+
+  it('has foreign_keys pragma set to 1 (ON)', () => {
+    const val = db.pragma('foreign_keys', { simple: true });
+    assert.equal(val, 1, 'foreign_keys pragma must be ON for FK constraints to be enforced');
+  });
+
+  it('schema version is at least 32 after migrations run', () => {
+    const row = /** @type {any} */ (
+      db.prepare(`SELECT MAX(version) AS v FROM schema_migrations`).get()
+    );
+    assert.ok(row.v >= 32, `expected schema version ≥ 32, got ${row.v}`);
+  });
+
+  it('rejects an order whose api_key_id references a non-existent api_key', () => {
+    assert.throws(
+      () =>
+        db
+          .prepare(
+            `INSERT INTO orders (id, amount_usdc, api_key_id) VALUES (?, '1.00', ?)`,
+          )
+          .run(uuidv4(), 'nonexistent-key-id'),
+      /FOREIGN KEY constraint failed/i,
+      'inserting an order with a dangling api_key_id must throw a FK violation',
+    );
+  });
+
+  it('allows an order with a null api_key_id (nullable FK)', () => {
+    assert.doesNotThrow(() =>
+      db
+        .prepare(`INSERT INTO orders (id, amount_usdc, api_key_id) VALUES (?, '1.00', NULL)`)
+        .run(uuidv4()),
+    );
+  });
+
+  it('allows an order whose api_key_id matches an existing api_key', () => {
+    const keyId = uuidv4();
+    db.prepare(`INSERT INTO api_keys (id, key_hash) VALUES (?, ?)`).run(keyId, `h-${keyId}`);
+    assert.doesNotThrow(() =>
+      db
+        .prepare(`INSERT INTO orders (id, amount_usdc, api_key_id) VALUES (?, '1.00', ?)`)
+        .run(uuidv4(), keyId),
+    );
+  });
+
+  it('cascade-deletes idempotency_keys rows when the referenced api_key is deleted', () => {
+    const keyId = uuidv4();
+    db.prepare(`INSERT INTO api_keys (id, key_hash) VALUES (?, ?)`).run(keyId, `h-${keyId}`);
+    db
+      .prepare(
+        `INSERT INTO idempotency_keys (key, api_key_id, response_status, response_body) VALUES (?, ?, 200, '{}')`,
+      )
+      .run('idem-key-1', keyId);
+
+    const before = /** @type {any} */ (
+      db.prepare(`SELECT COUNT(*) AS n FROM idempotency_keys WHERE api_key_id = ?`).get(keyId)
+    );
+    assert.equal(before.n, 1);
+
+    db.prepare(`DELETE FROM api_keys WHERE id = ?`).run(keyId);
+
+    const after = /** @type {any} */ (
+      db.prepare(`SELECT COUNT(*) AS n FROM idempotency_keys WHERE api_key_id = ?`).get(keyId)
+    );
+    assert.equal(after.n, 0, 'idempotency_keys must be cascade-deleted with their api_key');
+  });
+});
+
 describe('db.js - listOrders helper and query plan diagnostics (Part 3)', () => {
   it('throws TypeError if apiKeyId is missing', () => {
     assert.throws(() => db.listOrders(), /apiKeyId is required/);
