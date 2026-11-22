@@ -19,7 +19,7 @@ const { usdToXlm } = require('../payments/xlm-price');
 const { createChallenge, loadChallenge, loadOrderByReceiptId } = require('./challenge');
 const { buildDiscoveryDoc, buildChallengeBody, buildWwwAuthenticate } = require('./discovery');
 const { verifyAndCreateMppOrder } = require('./verify');
-const { waitForDelivery } = require('./wait-for-delivery');
+const { waitForDelivery, streamDelivery } = require('./wait-for-delivery');
 
 // Rate limiters for public endpoints
 const discoveryLimiter = rateLimit({
@@ -193,6 +193,39 @@ function buildMppRouter(opts = {}) {
       receipt_id: req.params.id,
       order_id: row.id,
       poll_url: `/v1/mpp/receipts/${req.params.id}`,
+    });
+  });
+
+  // ── Delivery stream (SSE, #969) ───────────────────────────────────────
+  // Agents hold this connection open and get the outcome as soon as it is
+  // known, instead of polling the receipt. Terminal bodies match the receipt
+  // endpoint's 200 and 502 responses.
+  router.get('/mpp/receipts/:id/stream', receiptLimiter, (req, res) => {
+    const receiptId = req.params.id;
+    const row = loadOrderByReceiptId(receiptId);
+    if (!row) {
+      return res.status(404).json({
+        error: 'receipt_not_found',
+        message: 'No receipt matches this id. It may have expired or never existed.',
+      });
+    }
+    return streamDelivery(req, res, {
+      orderId: row.id,
+      toEvent: (fresh) =>
+        fresh.status === 'delivered'
+          ? {
+              state: 'delivered',
+              receipt_id: receiptId,
+              order_id: fresh.id,
+              amount_usdc: fresh.amount_usdc,
+              card: extractCardFields(fresh),
+            }
+          : {
+              state: 'failed',
+              receipt_id: receiptId,
+              order_id: fresh.id,
+              message: 'Fulfillment failed. Funds are being refunded to the sender address.',
+            },
     });
   });
 

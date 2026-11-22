@@ -51,8 +51,6 @@ function redactCardFields(payload) {
 // env-tunable — see webhookRetryConfig below — so these remain the documented
 // defaults. MAX_WEBHOOK_ATTEMPTS additionally feeds the /status permanently-
 // failed metric (app.js, api/status.js), which keeps the default here.
-const WEBHOOK_RETRY_DELAYS_MS = [30_000, 60_000, 120_000];
-const MAX_WEBHOOK_ATTEMPTS = 3;
 // ── Webhook retry configuration (Part 2 of #webhook-retry) ──────────────────
 //
 // Part 1 shipped a fixed WEBHOOK_RETRY_DELAYS_MS lookup table with three
@@ -218,17 +216,11 @@ function parseRetryEnv(name, def) {
 function buildRetryConfig(overrides = {}) {
   return {
     // Base delay for the first retry. Env-tunable for dev/staging.
-    baseDelayMs: finiteOr(
-      overrides.baseDelayMs,
-      parseRetryEnv('WEBHOOK_RETRY_BASE_MS', 30_000),
-    ),
+    baseDelayMs: finiteOr(overrides.baseDelayMs, parseRetryEnv('WEBHOOK_RETRY_BASE_MS', 30_000)),
     // Exponential factor. Must be >= 1 to avoid collapsing delays.
     factor: Math.max(1, finiteOr(overrides.factor, parseRetryEnv('WEBHOOK_RETRY_FACTOR', 2))),
     // Hard cap per attempt to prevent multi-day waits on extreme attempt counts.
-    maxDelayMs: finiteOr(
-      overrides.maxDelayMs,
-      parseRetryEnv('WEBHOOK_RETRY_MAX_MS', 3_600_000),
-    ),
+    maxDelayMs: finiteOr(overrides.maxDelayMs, parseRetryEnv('WEBHOOK_RETRY_MAX_MS', 3_600_000)),
     // Total attempts before permanently abandoning the delivery.
     maxAttempts: Math.max(
       1,
@@ -280,11 +272,7 @@ function calculateWebhookBackoff(attempt, options = {}) {
   // factor < 1 would collapse the delay towards 0 — a tight retry loop.
   const factor = Math.max(1, finiteOr(options.factor, cfg.factor));
   const max = Math.max(0, finiteOr(options.maxDelayMs, cfg.maxDelayMs)); // 1 hour cap
-function calculateWebhookBackoff(attempt, config) {
-  const cfg = config || DEFAULT_RETRY_CONFIG;
-  const base = Math.max(0, finiteOr(cfg.baseDelayMs, 30_000));
-  const factor = Math.max(1, finiteOr(cfg.factor, 2));
-  const max = Math.max(0, finiteOr(cfg.maxDelayMs, 3_600_000));
+  const jitter = options.jitter !== undefined ? Boolean(options.jitter) : cfg.jitter;
   // `attempt` comes off a SQL column and may be float or NULL.
   const n = Number.isFinite(attempt) ? Math.max(1, Math.floor(attempt)) : 1;
 
@@ -296,7 +284,7 @@ function calculateWebhookBackoff(attempt, config) {
   // Full jitter: uniform random in [0, capped]. Math.random() returns a
   // float in [0, 1); multiply by (capped + 1) and floor to get an integer
   // in [0, capped].
-  if (cfg.jitter) {
+  if (jitter) {
     return Math.floor(Math.random() * (capped + 1));
   }
   return capped;
@@ -319,7 +307,6 @@ function calculateWebhookBackoff(attempt, config) {
 function getWebhookRetryDelay(attempt, config) {
   const cfg = config || DEFAULT_RETRY_CONFIG;
   const index = Number.isFinite(attempt) ? Math.max(0, Math.floor(attempt)) : 0;
-  return calculateWebhookBackoff(index + 1);
   // calculateWebhookBackoff is 1-indexed; the queue `attempts` column is the
   // number of sends that have already happened, so attempt=0 → first retry
   // → attempt number 1 in the formula.

@@ -6,6 +6,7 @@
 //
 // Rule evaluation order (first match wins):
 //   1. suspended          — hard block, immediate
+//   1b. blocked_mcc       — organisation-wide merchant category restriction
 //   2. single_tx_hard_cap — amount exceeds per-transaction ceiling
 //   3. after_hours        — outside allowed time window (UTC)
 //   4. blocked_day        — outside allowed days of week
@@ -18,6 +19,21 @@ const db = require('./db');
 const { event: bizEvent } = require('./lib/logger');
 
 const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+// Organisation-wide blocked merchant category codes (#980), comma-separated in
+// ORG_BLOCKED_MCCS. The default covers gambling (7995) and adult direct
+// marketing (5967). Firearms has no dedicated MCC, so set its codes in
+// ORG_BLOCKED_MCCS after compliance review.
+const DEFAULT_BLOCKED_MCCS = '7995,5967';
+
+function blockedMccs() {
+  return new Set(
+    (process.env.ORG_BLOCKED_MCCS ?? DEFAULT_BLOCKED_MCCS)
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+}
 
 /**
  * Evaluate all policy rules for a proposed transaction.
@@ -45,6 +61,27 @@ function checkPolicy(apiKeyId, amountUsdc, opts = {}) {
 
   const key = /** @type {any} */ (db.prepare(`SELECT * FROM api_keys WHERE id = ?`).get(apiKeyId));
   if (!key) return finalise('blocked', 'key_not_found', 'API key not found');
+
+  // ── 1b. Merchant category restriction (#980) ───────────────────────────────
+  // Only checked when the caller supplies an MCC. A malformed code fails closed
+  // rather than silently skipping the restriction.
+  if (opts.mcc !== undefined && opts.mcc !== null) {
+    const mcc = String(opts.mcc);
+    if (!/^\d{4}$/.test(mcc)) {
+      return finalise(
+        'blocked',
+        'invalid_mcc',
+        `Merchant category must be a 4-digit code (got: ${mcc}).`,
+      );
+    }
+    if (blockedMccs().has(mcc)) {
+      return finalise(
+        'blocked',
+        'blocked_mcc',
+        `Merchant category ${mcc} is blocked by organisation policy.`,
+      );
+    }
+  }
 
   // Defensive input validation. orders.js already rejects invalid amounts
   // before calling this, but checkPolicy is also exported for direct use

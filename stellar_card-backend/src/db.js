@@ -1050,7 +1050,7 @@ applyMigration(32, () => {
 
 // EXPECTED_SCHEMA_VERSION must match the last `applyMigration(N)` call
 // above. Bump it in lock-step with any new migration.
-const EXPECTED_SCHEMA_VERSION = 32;
+const EXPECTED_SCHEMA_VERSION = 34;
 const actualVersion = getSchemaVersion();
 if (actualVersion > EXPECTED_SCHEMA_VERSION) {
   console.error(
@@ -1088,7 +1088,14 @@ if (!consecutiveFailures) {
  * @param {number} [opts.offset=0] - Result offset
  * @returns {Array<Object>} List of matching order records
  */
-function listOrders({ apiKeyId, status, sinceCreatedAt, sinceUpdatedAt, limit = 50, offset = 0 } = {}) {
+function listOrders({
+  apiKeyId,
+  status,
+  sinceCreatedAt,
+  sinceUpdatedAt,
+  limit = 50,
+  offset = 0,
+} = {}) {
   if (!apiKeyId) {
     throw new TypeError('listOrders: apiKeyId is required');
   }
@@ -1159,9 +1166,7 @@ function explainListOrdersPlan(opts = {}) {
 // to mean "all events" (the previous and default behaviour).
 applyMigration(32, () => {
   try {
-    db.prepare(
-      `ALTER TABLE api_keys ADD COLUMN webhook_event_filter TEXT`,
-    ).run();
+    db.prepare(`ALTER TABLE api_keys ADD COLUMN webhook_event_filter TEXT`).run();
   } catch (e) {
     if (!e.message.includes('duplicate column')) throw e;
   }
@@ -1185,6 +1190,22 @@ applyMigration(33, () => {
     );
     CREATE INDEX IF NOT EXISTS idx_daily_stats_date ON daily_stats(date DESC);
   `);
+});
+
+// Migration 34: partial-payment ledger (#978). An underpaid order is parked in
+// 'partially_paid' with the amount received and the balance still owed, both in
+// the units of payment_asset (USDC for usdc_soroban, XLM for xlm_soroban).
+applyMigration(34, () => {
+  for (const sql of [
+    `ALTER TABLE orders ADD COLUMN amount_paid TEXT`,
+    `ALTER TABLE orders ADD COLUMN balance_due TEXT`,
+  ]) {
+    try {
+      db.prepare(sql).run();
+    } catch (e) {
+      if (!e.message.includes('duplicate column')) throw e;
+    }
+  }
 });
 
 /**
@@ -1248,4 +1269,3 @@ db.listOrdersCursor = listOrdersCursor;
 db.explainListOrdersPlan = explainListOrdersPlan;
 
 module.exports = db;
-

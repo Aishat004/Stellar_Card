@@ -668,17 +668,11 @@ describe('e2e stellar_card ↔ vcc: payment amount validation (audit F0/F7)', ()
     // Order must NOT have moved to ordering. No vcc invoice call should
     // have fired, and the row must still be in pending_payment.
     const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId);
-    assert.equal(order.status, 'pending_payment');
+    assert.equal(order.status, 'partially_paid');
+    assert.equal(order.amount_paid, '0.01');
+    assert.equal(order.balance_due, '99.9900000');
     const invoiceCalls = fakeVccCalls.filter((c) => c.url === '/api/jobs/invoice').length;
     assert.equal(invoiceCalls, 0, 'underpaid event must not trigger vcc invoice creation');
-
-    // And the attack payment must be durably recorded so ops can refund.
-    const unmatched = db
-      .prepare(`SELECT * FROM unmatched_payments WHERE claimed_order_id = ?`)
-      .get(orderId);
-    assert.ok(unmatched, 'underpaid event must land in unmatched_payments');
-    assert.equal(unmatched.reason, 'underpaid_usdc');
-    assert.equal(unmatched.amount_usdc, '0.01');
   });
 
   it('accepts USDC overpayment and records the excess', async () => {

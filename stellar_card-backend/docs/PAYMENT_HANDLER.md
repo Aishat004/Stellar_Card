@@ -183,7 +183,7 @@ This is the most security-critical check. Without it a `$0.01` on-chain payment 
    - Emit `payment.corrupt_order_amount` event.
    - `recordUnmatchedPayment({ reason: 'corrupt_order' })` and `return`.
 3. `compareDecimal(amountUsdc, order.amount_usdc)`:
-   - `< 0` (underpayment): `recordUnmatchedPayment({ reason: 'underpaid_usdc' })` and `return`.
+   - `< 0` (underpayment, #978): `markPartiallyPaid(...)` sets the order to `partially_paid` and records `amount_paid` and `balance_due`. Nothing is fulfilled or refunded.
    - `> 0` (overpayment): compute `excessUsdc = stroopsToDecimal(paid - expected)`, emit `payment.usdc_overpaid` (F3). **Order proceeds.**
    - `=== 0` (exact match): proceed normally.
 
@@ -193,7 +193,7 @@ This is the most security-critical check. Without it a `$0.01` on-chain payment 
 2. If falsy (XLM was not quoted — price oracle was unavailable when the order was created):
    - `recordUnmatchedPayment({ reason: 'xlm_not_quoted' })` and `return`.
 3. `compareDecimal(amountXlm, order.expected_xlm_amount)`:
-   - `< 0`: `recordUnmatchedPayment({ reason: 'underpaid_xlm' })` and `return`.
+   - `< 0` (underpayment, #978): same as USDC, parked as `partially_paid`.
    - `> 0`: compute `excessXlm`, emit `payment.xlm_overpaid`. **Order proceeds.**
    - `=== 0`: proceed normally.
 
@@ -326,8 +326,6 @@ catch (err) {
 | `unknown_order` | `orderId` not in `orders` table | Chain event for an order never created |
 | `order_status_<status>` | Order exists but `status ≠ 'pending_payment'` | Duplicate event or expired order |
 | `corrupt_order` | `order.amount_usdc` fails strict parse | Data integrity issue; order left in `pending_payment` |
-| `underpaid_usdc` | USDC on-chain amount < `order.amount_usdc` | Adversarial or agent SDK bug |
-| `underpaid_xlm` | XLM on-chain amount < `order.expected_xlm_amount` | Adversarial or agent SDK bug |
 | `xlm_not_quoted` | `order.expected_xlm_amount` is falsy | XLM oracle was down at order creation |
 | `unknown_asset` | `paymentAsset` is neither `usdc_soroban` nor `xlm_soroban` | Contract emit error |
 | `duplicate_payment` | Atomic UPDATE matched 0 rows | Lost the claim race; second event for same order |
@@ -399,7 +397,7 @@ If the process crashes between steps, `jobs.js` scans `status = 'ordering'` rows
 
 | Threat | Mitigation |
 |--------|-----------|
-| Treasury loss via underpayment (F0) | `compareDecimal` with BigInt arithmetic; underpaid → `unmatched_payments` |
+| Treasury loss via underpayment (F0) | `compareDecimal` with BigInt arithmetic; underpaid → `partially_paid` (nothing fulfilled) |
 | Treasury loss via corrupt `amount_usdc` (F2) | `parseStrictPositiveStroops` strict guard; `null` result → `unmatched_payments` |
 | Double-spend via ambiguous CTX tx (F1-jobs) | Park + store `ctx_stellar_txid`; no auto-refund until ops verifies |
 | Double-claim via duplicate events | Atomic `WHERE … AND status = 'pending_payment'` UPDATE |

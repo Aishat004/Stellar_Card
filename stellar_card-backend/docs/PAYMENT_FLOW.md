@@ -70,7 +70,7 @@ if (paymentAsset === 'usdc_soroban') {
   const cmp = compareDecimal(amountUsdc, expected);
   if (cmp < 0) {
     // Underpayment: Treasury loss vector
-    recordUnmatchedPayment(reason: 'underpaid_usdc');
+    markPartiallyPaid()  // status = 'partially_paid' (#978)
     return;
   }
   if (cmp > 0) {
@@ -95,7 +95,7 @@ if (paymentAsset === 'xlm_soroban') {
   const cmp = compareDecimal(amountXlm, expected);
   if (cmp < 0) {
     // Underpayment
-    recordUnmatchedPayment(reason: 'underpaid_xlm');
+    markPartiallyPaid()  // status = 'partially_paid' (#978)
     return;
   }
   if (cmp > 0) {
@@ -228,8 +228,6 @@ Payments that don't match a valid pending order are recorded to `unmatched_payme
 | `unknown_order` | order_id doesn't exist in DB | Check order was created |
 | `order_status_*` | Order already claimed, fulfilled, or failed | Check order history |
 | `corrupt_order` | order.amount_usdc is empty/NaN/invalid | Data migration issue |
-| `underpaid_usdc` | Paid amount < expected amount | Agent error or adversarial |
-| `underpaid_xlm` | Paid amount < expected XLM | Agent error or adversarial |
 | `xlm_not_quoted` | XLM not available during order creation | Price oracle was down |
 | `unknown_asset` | Asset is neither USDC nor XLM | Contract emit error |
 | `duplicate_payment` | Order already claimed by another event | Race condition (rare) |
