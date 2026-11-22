@@ -54,4 +54,96 @@ function insertPendingPaymentOrder(opts) {
   });
 }
 
-module.exports = { insertPendingPaymentOrder };
+// ── Order lifecycle finite state machine ─────────────────────────────────
+//
+// Every edge below is one that an existing UPDATE performs, with the guard
+// that performs it noted. Anything not listed is an invalid transition.
+// Terminal states (refunded, expired, rejected) have no outgoing edges.
+//
+// Not included: payment_confirmed, claim_received and stage1_done. They are
+// in the API status filter but nothing writes them, so no edge is defined.
+//
+// transitionOrder() is the guarded write for new call sites. It checks the
+// edge in code and then runs a compare-and-set on the current status, so a
+// concurrent writer that already moved the row makes it return false instead
+// of overwriting the change.
+
+/** @type {Readonly<Record<string, ReadonlyArray<string>>>} */
+const ORDER_TRANSITIONS = Object.freeze({
+  // payment-handler (ordering), jobs.js expiry, refund and recovery paths
+  pending_payment: Object.freeze([
+    'ordering',
+    'failed',
+    'expired',
+    'refund_pending',
+    'pending_manual_recovery',
+  ]),
+  // dashboard approval: approve → pending_payment, reject → rejected
+  awaiting_approval: Object.freeze(['pending_payment', 'rejected']),
+  // vcc-callback fulfilled/failed, payment failure paths, refund scheduling
+  ordering: Object.freeze(['delivered', 'failed', 'refund_pending', 'pending_manual_recovery']),
+  // vcc-callback fulfilled
+  delivered: Object.freeze(['refund_pending']),
+  // refund scheduling
+  failed: Object.freeze(['refund_pending']),
+  // fulfillment.js refund completion
+  refund_pending: Object.freeze(['refunded']),
+  // quarantine → ops recovery
+  pending_manual_recovery: Object.freeze(['delivered', 'refund_pending']),
+  refunded: Object.freeze([]),
+  expired: Object.freeze([]),
+  rejected: Object.freeze([]),
+});
+
+class InvalidOrderTransitionError extends Error {
+  /**
+   * @param {string} from
+   * @param {string} to
+   */
+  constructor(from, to) {
+    super(`invalid order transition: ${from} -> ${to}`);
+    this.name = 'InvalidOrderTransitionError';
+    this.from = from;
+    this.to = to;
+  }
+}
+
+/**
+ * @param {string} from
+ * @param {string} to
+ * @returns {boolean}
+ */
+function canTransition(from, to) {
+  const next = Object.prototype.hasOwnProperty.call(ORDER_TRANSITIONS, from)
+    ? ORDER_TRANSITIONS[from]
+    : undefined;
+  return Array.isArray(next) && next.includes(to);
+}
+
+/**
+ * Move an order from `from` to `to` with a compare-and-set on the row.
+ * Throws InvalidOrderTransitionError if the edge does not exist. Returns
+ * true when this call moved the row, and false when the row was no longer in
+ * `from` (a concurrent writer got there first).
+ *
+ * @param {{ id: string, from: string, to: string, now?: string }} opts
+ * @returns {boolean}
+ */
+function transitionOrder({ id, from, to, now }) {
+  if (!canTransition(from, to)) throw new InvalidOrderTransitionError(from, to);
+  const result = db
+    .prepare(
+      `UPDATE orders SET status = @to, updated_at = @now
+        WHERE id = @id AND status = @from`,
+    )
+    .run({ id, from, to, now: now ?? new Date().toISOString() });
+  return result.changes === 1;
+}
+
+module.exports = {
+  insertPendingPaymentOrder,
+  ORDER_TRANSITIONS,
+  InvalidOrderTransitionError,
+  canTransition,
+  transitionOrder,
+};

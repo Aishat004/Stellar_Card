@@ -46,6 +46,11 @@ function redactCardFields(payload) {
   };
 }
 
+// Default retry schedule: exponential backoff with base 30s and multiplier 2
+// (attempt 1 → 30s, attempt 2 → 60s, attempt 3 → 120s). The runtime ladder is
+// env-tunable — see webhookRetryConfig below — so these remain the documented
+// defaults. MAX_WEBHOOK_ATTEMPTS additionally feeds the /status permanently-
+// failed metric (app.js, api/status.js), which keeps the default here.
 // ── Webhook retry configuration (Part 2 of #webhook-retry) ──────────────────
 //
 // Part 1 shipped a fixed WEBHOOK_RETRY_DELAYS_MS lookup table with three
@@ -266,7 +271,7 @@ function calculateWebhookBackoff(attempt, options = {}) {
   const cfg = webhookRetryConfig();
   const base = Math.max(0, finiteOr(options.baseDelayMs, cfg.baseDelayMs));
   const factor = Math.max(1, finiteOr(options.factor, cfg.factor));
-  const max = Math.max(0, finiteOr(options.maxDelayMs, cfg.maxDelayMs));
+  const max = Math.max(0, finiteOr(options.maxDelayMs, cfg.maxDelayMs)); // 1 hour cap
   // `attempt` comes off a SQL column and may be float or NULL.
   const n = Number.isFinite(attempt) ? Math.max(1, Math.floor(attempt)) : 1;
 
@@ -286,7 +291,10 @@ function calculateWebhookBackoff(attempt, options = {}) {
  */
 function getWebhookRetryDelay(attempt, config) {
   const index = Number.isFinite(attempt) ? Math.max(0, Math.floor(attempt)) : 0;
-  return calculateWebhookBackoff(index + 1, config);
+  // calculateWebhookBackoff is 1-indexed; the queue `attempts` column is the
+  // number of sends that have already happened, so attempt=0 → first retry
+  // → attempt number 1 in the formula.
+  return calculateWebhookBackoff(index + 1, cfg);
 }
 
 // Audit A-7: per-origin circuit breaker. If a webhook origin fails
@@ -847,8 +855,6 @@ module.exports = {
   // Test-only exports (audit hardening + retry-config introspection).
   _resetWebhookRetryConfigWarned,
   buildRetryConfig,
-  WEBHOOK_RETRY_DELAYS_MS,
-  MAX_WEBHOOK_ATTEMPTS,
   DEFAULT_RETRY_CONFIG,
   // Test-only exports for the 2026-04-15 audit hardening.
   _computeUsdcRefundAmount: computeUsdcRefundAmount,

@@ -198,9 +198,97 @@ function _resetWarnedStates() {
   _warnedUnknownStates.clear();
 }
 
+// ── Atomic spend reservation ─────────────────────────────────────────────
+//
+// Several workers can share one agent API key. Each must check the key's
+// spend_limit_usdc against settled spend plus every in-flight order before
+// it creates a new one. A read-then-insert done in separate statements lets
+// two workers both pass the check. reserveAgentSpend runs the check and an
+// optional follow-up write in one BEGIN IMMEDIATE transaction, which takes
+// the write lock up front, so no other writer can slip in between.
+//
+// Amounts are compared as integer cents. Float sums of decimal strings can
+// drift at the cent boundary.
+
+// Statuses whose amounts count against the limit before delivery. Same set
+// POST /v1/orders uses in api/orders.js.
+const IN_FLIGHT_SPEND_STATUSES_SQL = `('pending_payment','ordering','refund_pending','awaiting_approval')`;
+
+const _spendKeyStmt = db.prepare(
+  `SELECT spend_limit_usdc, total_spent_usdc FROM api_keys WHERE id = ?`,
+);
+const _inFlightCentsStmt = db.prepare(
+  `SELECT COALESCE(SUM(CAST(ROUND(CAST(amount_usdc AS REAL) * 100) AS INTEGER)), 0) AS cents
+     FROM orders
+    WHERE api_key_id = ? AND status IN ${IN_FLIGHT_SPEND_STATUSES_SQL}`,
+);
+
+/**
+ * Parse a decimal USDC string to integer cents. Returns NaN when the input
+ * is not a finite number.
+ * @param {unknown} value
+ */
+function _toCents(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.round(n * 100) : NaN;
+}
+
+/**
+ * Pure check, run inside a transaction by reserveAgentSpend.
+ * @param {string} apiKeyId
+ * @param {string} amountUsdc
+ */
+function _checkSpend(apiKeyId, amountUsdc) {
+  const key = /** @type {any} */ (_spendKeyStmt.get(apiKeyId));
+  if (!key) return { ok: false, reason: 'not_found' };
+  const amount = _toCents(amountUsdc);
+  if (!Number.isFinite(amount) || amount <= 0) return { ok: false, reason: 'invalid_amount' };
+  // No limit configured means the key is unlimited, same as POST /v1/orders.
+  if (!key.spend_limit_usdc) return { ok: true };
+
+  const limit = _toCents(key.spend_limit_usdc);
+  const settled = _toCents(key.total_spent_usdc ?? '0');
+  const inFlight = /** @type {any} */ (_inFlightCentsStmt.get(apiKeyId)).cents;
+  if (settled + inFlight + amount > limit) {
+    return {
+      ok: false,
+      reason: 'spend_limit_exceeded',
+      limit: key.spend_limit_usdc,
+      spent: key.total_spent_usdc,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * Atomically check that `amountUsdc` fits within the agent's spend limit and,
+ * only if it does, run `onReserved` in the same transaction.
+ *
+ * Use this for any write that consumes spend, such as inserting an order row,
+ * so concurrent workers of the same agent cannot both pass the check.
+ *
+ * @template T
+ * @param {string} apiKeyId
+ * @param {string} amountUsdc - Decimal string, e.g. '10.00'.
+ * @param {() => T} [onReserved] - Runs inside the transaction only when allowed.
+ * @returns {{ ok: true, result: T | undefined } | { ok: false, reason: string, limit?: string, spent?: string }}
+ */
+function reserveAgentSpend(apiKeyId, amountUsdc, onReserved) {
+  return /** @type {any} */ (
+    db
+      .transaction(() => {
+        const verdict = _checkSpend(apiKeyId, amountUsdc);
+        if (!verdict.ok) return verdict;
+        return { ok: true, result: onReserved ? onReserved() : undefined };
+      })
+      .immediate()
+  );
+}
+
 module.exports = {
   deriveAgentState,
   batchDeliveredCounts,
+  reserveAgentSpend,
   STATE_LABELS,
   _resetWarnedStates,
 };

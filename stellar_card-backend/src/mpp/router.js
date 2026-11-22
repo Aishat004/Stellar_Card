@@ -17,34 +17,27 @@ const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const { event: bizEvent } = require('../lib/logger');
 const { openCard } = require('../lib/card-vault');
 const { usdToXlm } = require('../payments/xlm-price');
-const { createChallenge, loadChallenge, loadOrderByReceiptId } = require('./challenge');
+const {
+  createChallenge,
+  loadChallenge,
+  loadOrderByReceiptId,
+  parseChallengeRequest,
+} = require('./challenge');
 const { buildDiscoveryDoc, buildChallengeBody, buildWwwAuthenticate } = require('./discovery');
 const { verifyAndCreateMppOrder } = require('./verify');
 const { waitForDelivery } = require('./wait-for-delivery');
 
-// RFC 7807 problem details for every error response on this router.
-// `type` is a URN so agents can branch on a stable identifier without us
-// inventing a documentation domain. The short `error` code is kept as an
-// extension member so clients that already read it keep working.
-function sendProblem(res, status, code, detail, extra = {}) {
-  return res
-    .status(status)
-    .type('application/problem+json')
-    .json({
-      type: `urn:stellar-card:error:${code}`,
-      title: STATUS_CODES[status],
-      status,
-      detail,
-      error: code,
-      ...extra,
-    });
-}
+// Rate limiters for public endpoints.
+//
+// ipKeyGenerator takes an IP string, not the request. Passing `req` returns
+// a fresh object per call, so the store never matches a previous hit and the
+// limit never trips. Always pass req.ip.
+const ipKey = (/** @type {any} */ req) => ipKeyGenerator(req.ip || 'unknown');
 
-// Rate limiters for public endpoints
 const discoveryLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 60,
-  keyGenerator: (/** @type {any} */ req) => ipKeyGenerator(req),
+  keyGenerator: ipKey,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   handler: (_req, res) =>
@@ -54,7 +47,7 @@ const discoveryLimiter = rateLimit({
 const receiptLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 60,
-  keyGenerator: (/** @type {any} */ req) => ipKeyGenerator(req),
+  keyGenerator: ipKey,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   handler: (_req, res) =>
@@ -65,19 +58,22 @@ const receiptLimiter = rateLimit({
 // must never be a free DoS amplifier — each GET creates a row in
 // mpp_challenges, so we need a ceiling. 30/min/IP is plenty for a
 // legitimate agent and cheap to enforce.
+// A non-numeric MPP_CHALLENGE_RATE_LIMIT must not disable the limit
+// (NaN never trips the check), so fall back to the default instead.
+const CHALLENGE_RATE_LIMIT_DEFAULT = 30;
+const challengeRateLimit = Number.parseInt(process.env.MPP_CHALLENGE_RATE_LIMIT ?? '', 10);
 const challengeLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: parseInt(process.env.MPP_CHALLENGE_RATE_LIMIT || '30', 10),
-  keyGenerator: (/** @type {any} */ req) => ipKeyGenerator(req),
+  limit:
+    Number.isFinite(challengeRateLimit) && challengeRateLimit > 0
+      ? challengeRateLimit
+      : CHALLENGE_RATE_LIMIT_DEFAULT,
+  keyGenerator: ipKey,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   handler: (_req, res) =>
     sendProblem(res, 429, 'too_many_requests', 'MPP challenge rate limit exceeded. Retry in a minute.'),
 });
-
-const AMOUNT_RE = /^\d+(?:\.\d{1,2})?$/;
-const MIN_AMOUNT = 0.01;
-const MAX_AMOUNT = 10_000.0;
 
 /**
  * Build the router. Factored as a function so tests (and any future
@@ -100,24 +96,11 @@ function buildMppRouter(opts = {}) {
   // GET /v1/cards/visa/:amount returns 402 with the challenge. Phase 2
   // layers verification on top when Authorization: Payment is present.
   router.get('/cards/visa/:amount', challengeLimiter, async (req, res) => {
-    const amountStr = String(req.params.amount || '');
-    if (!AMOUNT_RE.test(amountStr)) {
-      return sendProblem(
-        res,
-        400,
-        'invalid_amount',
-        'Amount must be a decimal like "10" or "10.00" with up to 2 decimal places.',
-      );
+    const parsed = parseChallengeRequest({ amount: String(req.params.amount || '') });
+    if (!parsed.ok) {
+      return res.status(400).json({ error: parsed.error, message: parsed.message });
     }
-    const amount = parseFloat(amountStr);
-    if (!Number.isFinite(amount) || amount < MIN_AMOUNT || amount > MAX_AMOUNT) {
-      return sendProblem(
-        res,
-        400,
-        'amount_out_of_bounds',
-        `Amount must be between ${MIN_AMOUNT} and ${MAX_AMOUNT} USDC.`,
-      );
-    }
+    const amountStr = parsed.amount;
 
     const resourcePath = `/v1/cards/visa/${amountStr}`;
     const amountUsdc = normaliseAmount(amountStr);
