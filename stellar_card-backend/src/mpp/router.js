@@ -16,7 +16,12 @@ const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const { event: bizEvent } = require('../lib/logger');
 const { openCard } = require('../lib/card-vault');
 const { usdToXlm } = require('../payments/xlm-price');
-const { createChallenge, loadChallenge, loadOrderByReceiptId } = require('./challenge');
+const {
+  createChallenge,
+  loadChallenge,
+  loadOrderByReceiptId,
+  parseChallengeRequest,
+} = require('./challenge');
 const { buildDiscoveryDoc, buildChallengeBody, buildWwwAuthenticate } = require('./discovery');
 const { verifyAndCreateMppOrder } = require('./verify');
 const { waitForDelivery } = require('./wait-for-delivery');
@@ -73,10 +78,6 @@ const challengeLimiter = rateLimit({
     }),
 });
 
-const AMOUNT_RE = /^\d+(?:\.\d{1,2})?$/;
-const MIN_AMOUNT = 0.01;
-const MAX_AMOUNT = 10_000.0;
-
 /**
  * Build the router. Factored as a function so tests (and any future
  * isolation need) can construct it with custom deps.
@@ -98,20 +99,11 @@ function buildMppRouter(opts = {}) {
   // GET /v1/cards/visa/:amount returns 402 with the challenge. Phase 2
   // layers verification on top when Authorization: Payment is present.
   router.get('/cards/visa/:amount', challengeLimiter, async (req, res) => {
-    const amountStr = String(req.params.amount || '');
-    if (!AMOUNT_RE.test(amountStr)) {
-      return res.status(400).json({
-        error: 'invalid_amount',
-        message: 'Amount must be a decimal like "10" or "10.00" with up to 2 decimal places.',
-      });
+    const parsed = parseChallengeRequest({ amount: String(req.params.amount || '') });
+    if (!parsed.ok) {
+      return res.status(400).json({ error: parsed.error, message: parsed.message });
     }
-    const amount = parseFloat(amountStr);
-    if (!Number.isFinite(amount) || amount < MIN_AMOUNT || amount > MAX_AMOUNT) {
-      return res.status(400).json({
-        error: 'amount_out_of_bounds',
-        message: `Amount must be between ${MIN_AMOUNT} and ${MAX_AMOUNT} USDC.`,
-      });
-    }
+    const amountStr = parsed.amount;
 
     const resourcePath = `/v1/cards/visa/${amountStr}`;
     const amountUsdc = normaliseAmount(amountStr);
