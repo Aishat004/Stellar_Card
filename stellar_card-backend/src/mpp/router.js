@@ -12,57 +12,68 @@
 // bounded-wait fulfillment handoff.
 
 const { Router } = require('express');
+const { STATUS_CODES } = require('http');
 const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const { event: bizEvent } = require('../lib/logger');
 const { openCard } = require('../lib/card-vault');
 const { usdToXlm } = require('../payments/xlm-price');
-const { createChallenge, loadChallenge, loadOrderByReceiptId } = require('./challenge');
+const {
+  createChallenge,
+  loadChallenge,
+  loadOrderByReceiptId,
+  parseChallengeRequest,
+} = require('./challenge');
 const { buildDiscoveryDoc, buildChallengeBody, buildWwwAuthenticate } = require('./discovery');
 const { verifyAndCreateMppOrder } = require('./verify');
 const { waitForDelivery, streamDelivery } = require('./wait-for-delivery');
 
-// Rate limiters for public endpoints
+// Rate limiters for public endpoints.
+//
+// ipKeyGenerator takes an IP string, not the request. Passing `req` returns
+// a fresh object per call, so the store never matches a previous hit and the
+// limit never trips. Always pass req.ip.
+const ipKey = (/** @type {any} */ req) => ipKeyGenerator(req.ip || 'unknown');
+
 const discoveryLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 60,
-  keyGenerator: (/** @type {any} */ req) => ipKeyGenerator(req),
+  keyGenerator: ipKey,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  handler: (_req, res) =>
+    sendProblem(res, 429, 'too_many_requests', 'Discovery rate limit exceeded. Retry in a minute.'),
 });
 
 const receiptLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 60,
-  keyGenerator: (/** @type {any} */ req) => ipKeyGenerator(req),
+  keyGenerator: ipKey,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   handler: (_req, res) =>
-    res.status(429).json({
-      error: 'too_many_requests',
-      message: 'Receipt polling rate limit exceeded. Retry in a minute.',
-    }),
+    sendProblem(res, 429, 'too_many_requests', 'Receipt polling rate limit exceeded. Retry in a minute.'),
 });
 
 // Per-IP rate limit on challenge creation. An unauthenticated endpoint
 // must never be a free DoS amplifier — each GET creates a row in
 // mpp_challenges, so we need a ceiling. 30/min/IP is plenty for a
 // legitimate agent and cheap to enforce.
+// A non-numeric MPP_CHALLENGE_RATE_LIMIT must not disable the limit
+// (NaN never trips the check), so fall back to the default instead.
+const CHALLENGE_RATE_LIMIT_DEFAULT = 30;
+const challengeRateLimit = Number.parseInt(process.env.MPP_CHALLENGE_RATE_LIMIT ?? '', 10);
 const challengeLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: parseInt(process.env.MPP_CHALLENGE_RATE_LIMIT || '30', 10),
-  keyGenerator: (/** @type {any} */ req) => ipKeyGenerator(req),
+  limit:
+    Number.isFinite(challengeRateLimit) && challengeRateLimit > 0
+      ? challengeRateLimit
+      : CHALLENGE_RATE_LIMIT_DEFAULT,
+  keyGenerator: ipKey,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   handler: (_req, res) =>
-    res.status(429).json({
-      error: 'too_many_requests',
-      message: 'MPP challenge rate limit exceeded. Retry in a minute.',
-    }),
+    sendProblem(res, 429, 'too_many_requests', 'MPP challenge rate limit exceeded. Retry in a minute.'),
 });
-
-const AMOUNT_RE = /^\d+(?:\.\d{1,2})?$/;
-const MIN_AMOUNT = 0.01;
-const MAX_AMOUNT = 10_000.0;
 
 /**
  * Build the router. Factored as a function so tests (and any future
@@ -85,20 +96,11 @@ function buildMppRouter(opts = {}) {
   // GET /v1/cards/visa/:amount returns 402 with the challenge. Phase 2
   // layers verification on top when Authorization: Payment is present.
   router.get('/cards/visa/:amount', challengeLimiter, async (req, res) => {
-    const amountStr = String(req.params.amount || '');
-    if (!AMOUNT_RE.test(amountStr)) {
-      return res.status(400).json({
-        error: 'invalid_amount',
-        message: 'Amount must be a decimal like "10" or "10.00" with up to 2 decimal places.',
-      });
+    const parsed = parseChallengeRequest({ amount: String(req.params.amount || '') });
+    if (!parsed.ok) {
+      return res.status(400).json({ error: parsed.error, message: parsed.message });
     }
-    const amount = parseFloat(amountStr);
-    if (!Number.isFinite(amount) || amount < MIN_AMOUNT || amount > MAX_AMOUNT) {
-      return res.status(400).json({
-        error: 'amount_out_of_bounds',
-        message: `Amount must be between ${MIN_AMOUNT} and ${MAX_AMOUNT} USDC.`,
-      });
-    }
+    const amountStr = parsed.amount;
 
     const resourcePath = `/v1/cards/visa/${amountStr}`;
     const amountUsdc = normaliseAmount(amountStr);
@@ -119,10 +121,7 @@ function buildMppRouter(opts = {}) {
           status: v.status,
           reason: v.reason,
         });
-        return res.status(v.status).json({
-          error: v.reason,
-          ...(v.detail && { detail: v.detail }),
-        });
+        return sendProblem(res, v.status, v.reason, v.detail);
       }
       return handleDeliveryForVerdict(req, res, verdict);
     }
@@ -163,10 +162,12 @@ function buildMppRouter(opts = {}) {
   router.get('/mpp/receipts/:id', receiptLimiter, (req, res) => {
     const row = loadOrderByReceiptId(req.params.id);
     if (!row) {
-      return res.status(404).json({
-        error: 'receipt_not_found',
-        message: 'No receipt matches this id. It may have expired or never existed.',
-      });
+      return sendProblem(
+        res,
+        404,
+        'receipt_not_found',
+        'No receipt matches this id. It may have expired or never existed.',
+      );
     }
     if (row.status === 'delivered') {
       return res
@@ -181,12 +182,13 @@ function buildMppRouter(opts = {}) {
         });
     }
     if (row.status === 'failed') {
-      return res.status(502).json({
-        state: 'failed',
-        receipt_id: req.params.id,
-        order_id: row.id,
-        message: 'Fulfillment failed. Funds are being refunded to the sender address.',
-      });
+      return sendProblem(
+        res,
+        502,
+        'fulfillment_failed',
+        'Fulfillment failed. Funds are being refunded to the sender address.',
+        { state: 'failed', receipt_id: req.params.id, order_id: row.id },
+      );
     }
     return res.status(202).json({
       state: 'fulfilling',
@@ -254,12 +256,13 @@ async function handleDeliveryForVerdict(req, res, verdict) {
     });
   }
   if (result.state === 'failed') {
-    return res.status(502).json({
-      state: 'failed',
-      receipt_id: verdict.receiptId,
-      order_id: verdict.orderId,
-      message: 'Fulfillment failed. Funds are being refunded to the sender address.',
-    });
+    return sendProblem(
+      res,
+      502,
+      'fulfillment_failed',
+      'Fulfillment failed. Funds are being refunded to the sender address.',
+      { state: 'failed', receipt_id: verdict.receiptId, order_id: verdict.orderId },
+    );
   }
   // timeout — hand off to the receipt polling endpoint.
   const location = `/v1/mpp/receipts/${verdict.receiptId}`;

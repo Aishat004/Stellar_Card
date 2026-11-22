@@ -1158,20 +1158,6 @@ function explainListOrdersPlan(opts = {}) {
   return db.prepare(`EXPLAIN QUERY PLAN ${query}`).all(...params);
 }
 
-// Migration 32: webhook event subscription filter per api key.
-//
-// Agents may now subscribe only to specific event types (e.g. only
-// order.fulfilled and order.failed) instead of receiving all events.
-// The column stores a JSON array of event-type strings, or NULL / '*'
-// to mean "all events" (the previous and default behaviour).
-applyMigration(32, () => {
-  try {
-    db.prepare(`ALTER TABLE api_keys ADD COLUMN webhook_event_filter TEXT`).run();
-  } catch (e) {
-    if (!e.message.includes('duplicate column')) throw e;
-  }
-});
-
 // Migration 33: daily_stats table for nightly order volume and revenue summary.
 //
 // The nightly job in jobs.js (runDailyStats) aggregates delivered orders by
@@ -1192,19 +1178,19 @@ applyMigration(33, () => {
   `);
 });
 
-// Migration 34: partial-payment ledger (#978). An underpaid order is parked in
-// 'partially_paid' with the amount received and the balance still owed, both in
-// the units of payment_asset (USDC for usdc_soroban, XLM for xlm_soroban).
+// Migration 34: webhook event subscription filter per api key.
+//
+// Agents may now subscribe only to specific event types (e.g. only
+// order.fulfilled and order.failed) instead of receiving all events.
+// The column stores a JSON array of event-type strings, or NULL / '*'
+// to mean "all events" (the previous and default behaviour).
 applyMigration(34, () => {
-  for (const sql of [
-    `ALTER TABLE orders ADD COLUMN amount_paid TEXT`,
-    `ALTER TABLE orders ADD COLUMN balance_due TEXT`,
-  ]) {
-    try {
-      db.prepare(sql).run();
-    } catch (e) {
-      if (!e.message.includes('duplicate column')) throw e;
-    }
+  try {
+    db.prepare(
+      `ALTER TABLE api_keys ADD COLUMN webhook_event_filter TEXT`,
+    ).run();
+  } catch (e) {
+    if (!e.message.includes('duplicate column')) throw e;
   }
 });
 

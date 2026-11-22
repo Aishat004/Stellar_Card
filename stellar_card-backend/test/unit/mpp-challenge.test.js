@@ -20,6 +20,7 @@ const {
   attachReceiptId,
   loadOrderByReceiptId,
   sweepExpiredChallenges,
+  parseChallengeRequest,
   CHALLENGE_ID_PREFIX,
   RECEIPT_ID_PREFIX,
 } = require('../../src/mpp/challenge');
@@ -255,5 +256,35 @@ describe('sweepExpiredChallenges', () => {
     const row = loadChallenge(c.id);
     assert.ok(row);
     assert.equal(row.redeemed_tx_hash, 'dd'.repeat(32));
+  });
+});
+
+describe('parseChallengeRequest — amount validation (Zod)', () => {
+  it('accepts whole and two-decimal amounts within bounds', () => {
+    for (const amount of ['10', '10.00', '0.01', '10000']) {
+      assert.deepEqual(parseChallengeRequest({ amount }), { ok: true, amount });
+    }
+  });
+
+  it('rejects malformed amounts with invalid_amount', () => {
+    for (const amount of ['', 'abc', '1.234', '-5', ' 5', '1e3', '10.']) {
+      const r = parseChallengeRequest({ amount });
+      assert.equal(r.ok, false, `expected ${JSON.stringify(amount)} to be rejected`);
+      assert.equal(r.error, 'invalid_amount');
+    }
+  });
+
+  it('rejects out-of-range amounts with amount_out_of_bounds', () => {
+    for (const amount of ['0', '0.00', '10000.01']) {
+      const r = parseChallengeRequest({ amount });
+      assert.equal(r.ok, false);
+      assert.equal(r.error, 'amount_out_of_bounds');
+    }
+  });
+
+  it('rejects non-string input without throwing', () => {
+    const r = parseChallengeRequest({ amount: 10 });
+    assert.equal(r.ok, false);
+    assert.equal(r.error, 'invalid_amount');
   });
 });
