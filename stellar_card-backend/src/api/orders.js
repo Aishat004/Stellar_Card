@@ -163,6 +163,7 @@ const CreateOrderErrorCodes = {
 // typo'd the filter".
 const ORDER_STATUSES = [
   'pending_payment',
+  'partially_paid',
   'awaiting_approval',
   'payment_confirmed',
   'claim_received',
@@ -612,7 +613,7 @@ router.post('/', orderCreateLimiter, validateCreateOrder, async (req, res) => {
 
     // Policy engine — its daily_limit query is now ALSO inside the txn,
     // so daily_limit can't be breached by concurrent POSTs either.
-    const policyResult = checkPolicy(req.apiKey.id, amount_usdc);
+    const policyResult = checkPolicy(req.apiKey.id, amount_usdc, { mcc: req.body.mcc });
     if (policyResult.decision === 'blocked') {
       return {
         kind: 'policy_blocked',
@@ -881,6 +882,7 @@ router.get('/', orderPollLimiter, validateListOrders, (req, res) => {
 const PHASE = {
   awaiting_approval: 'awaiting_approval',
   pending_payment: 'awaiting_payment',
+  partially_paid: 'partially_paid',
   expired: 'expired',
   rejected: 'rejected',
   ordering: 'processing',

@@ -216,17 +216,11 @@ function parseRetryEnv(name, def) {
 function buildRetryConfig(overrides = {}) {
   return {
     // Base delay for the first retry. Env-tunable for dev/staging.
-    baseDelayMs: finiteOr(
-      overrides.baseDelayMs,
-      parseRetryEnv('WEBHOOK_RETRY_BASE_MS', 30_000),
-    ),
+    baseDelayMs: finiteOr(overrides.baseDelayMs, parseRetryEnv('WEBHOOK_RETRY_BASE_MS', 30_000)),
     // Exponential factor. Must be >= 1 to avoid collapsing delays.
     factor: Math.max(1, finiteOr(overrides.factor, parseRetryEnv('WEBHOOK_RETRY_FACTOR', 2))),
     // Hard cap per attempt to prevent multi-day waits on extreme attempt counts.
-    maxDelayMs: finiteOr(
-      overrides.maxDelayMs,
-      parseRetryEnv('WEBHOOK_RETRY_MAX_MS', 3_600_000),
-    ),
+    maxDelayMs: finiteOr(overrides.maxDelayMs, parseRetryEnv('WEBHOOK_RETRY_MAX_MS', 3_600_000)),
     // Total attempts before permanently abandoning the delivery.
     maxAttempts: Math.max(
       1,

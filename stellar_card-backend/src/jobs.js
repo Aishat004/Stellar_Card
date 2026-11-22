@@ -441,15 +441,18 @@ async function reconcileOrderingFulfillment() {
     }
 
     // Claim this attempt atomically so two overlapping job ticks don't both retry.
+    // #979: also require the updated_at version we read. If payment-handler
+    // took the pay lock since our SELECT (it bumps updated_at), it owns the
+    // payment and this claim must fail rather than pay CTX a second time.
     const claim = db
       .prepare(
         `
       UPDATE orders
       SET fulfillment_attempt = fulfillment_attempt + 1, updated_at = ?
-      WHERE id = ? AND status = 'ordering' AND fulfillment_attempt = ?
+      WHERE id = ? AND status = 'ordering' AND fulfillment_attempt = ? AND updated_at = ?
     `,
       )
-      .run(new Date().toISOString(), order.id, order.fulfillment_attempt);
+      .run(new Date().toISOString(), order.id, order.fulfillment_attempt, order.updated_at);
     if (claim.changes === 0) {
       log(`  ${shortId} — skipped (claim lost to concurrent retry)`);
       continue;
@@ -933,7 +936,10 @@ const CARD_DATA_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 
 function isPastCardRetention(expiryBuffer, nowMs) {
   if (!expiryBuffer) return false;
-  const match = expiryBuffer.toString('utf8').trim().match(/^(0[1-9]|1[0-2])\/(\d{2}|\d{4})$/);
+  const match = expiryBuffer
+    .toString('utf8')
+    .trim()
+    .match(/^(0[1-9]|1[0-2])\/(\d{2}|\d{4})$/);
   if (!match) return false;
 
   const month = Number(match[1]);
@@ -1555,7 +1561,11 @@ function startJobs() {
 
   // Daily database backup (#993). Runs immediately on startup then every 24 h.
   runDatabaseBackup();
-  _jobIntervals.push(setInterval(() => { runDatabaseBackup(); }, BACKUP_INTERVAL_MS));
+  _jobIntervals.push(
+    setInterval(() => {
+      runDatabaseBackup();
+    }, BACKUP_INTERVAL_MS),
+  );
 
   // Nightly daily-stats aggregation — runs at 00:05 UTC every day.
   // Schedules itself to fire at the next 00:05 UTC and then every 24 h.

@@ -59,9 +59,12 @@ const { publicMessage } = require('./lib/sanitize-error');
 // VCC HTTP server needed), and restore production implementations via
 // _resetTestHooks. Production call sites below always go through the
 // `let` bindings, never the module objects directly.
-let _getInvoice = vccClient.getInvoice;
-let _notifyPaid = vccClient.notifyPaid;
-let _refundOrQuarantine = fulfillment.refundOrQuarantine;
+// Defaults are lazy wrappers, not captured references, so a module-level
+// stub installed after load (vccClient.getInvoice = ..., fulfillment.refundOrQuarantine = ...)
+// is still honoured at call time.
+let _getInvoice = (...args) => vccClient.getInvoice(...args);
+let _notifyPaid = (...args) => vccClient.notifyPaid(...args);
+let _refundOrQuarantine = (...args) => fulfillment.refundOrQuarantine(...args);
 
 /**
  * Inject stub vcc-client functions for tests. Omitted keys keep their
@@ -84,9 +87,9 @@ function _setFulfillment(stubs = {}) {
 
 /** Restore the production vcc-client / fulfillment implementations. */
 function _resetTestHooks() {
-  _getInvoice = vccClient.getInvoice;
-  _notifyPaid = vccClient.notifyPaid;
-  _refundOrQuarantine = fulfillment.refundOrQuarantine;
+  _getInvoice = (...args) => vccClient.getInvoice(...args);
+  _notifyPaid = (...args) => vccClient.notifyPaid(...args);
+  _refundOrQuarantine = (...args) => fulfillment.refundOrQuarantine(...args);
 }
 
 /**
@@ -214,6 +217,41 @@ function recordUnmatchedPayment(row) {
   }
 }
 
+/**
+ * #978: an on-chain payment below the quoted total. The order is parked in
+ * 'partially_paid' with the amount received and the balance still owed, both
+ * in the units of the asset the agent paid with. Nothing is fulfilled and
+ * nothing is refunded here: the balance is ledger state for ops (or a future
+ * top-up flow) to act on.
+ * @param {{txid: string, senderAddress: string|null, paymentAsset: string, amountUsdc: string|null, amountXlm: string|null, orderId: string, requiredAmount: string}} evt
+ */
+function markPartiallyPaid(evt) {
+  const paid = (evt.paymentAsset === 'usdc_soroban' ? evt.amountUsdc : evt.amountXlm) ?? '0';
+  const balanceDue = stroopsToDecimal(toStroops(evt.requiredAmount) - toStroops(paid));
+  const now = new Date().toISOString();
+  const res = db
+    .prepare(
+      `UPDATE orders
+       SET status = 'partially_paid', payment_asset = ?, stellar_txid = ?,
+           sender_address = ?, amount_paid = ?, balance_due = ?, updated_at = ?
+       WHERE id = ? AND status = 'pending_payment'`,
+    )
+    .run(evt.paymentAsset, evt.txid, evt.senderAddress, paid, balanceDue, now, evt.orderId);
+  if (res.changes === 0) {
+    // Lost the race to another event for this order; treat as a duplicate.
+    recordUnmatchedPayment({ ...evt, reason: 'duplicate_payment' });
+    return;
+  }
+  logger.event('payment.partially_paid', {
+    order_id: evt.orderId,
+    txid: evt.txid,
+    payment_asset: evt.paymentAsset,
+    required: evt.requiredAmount,
+    paid,
+    balance_due: balanceDue,
+  });
+}
+
 async function handlePayment({
   txid,
   paymentAsset,
@@ -304,14 +342,14 @@ async function handlePayment({
     }
     const cmp = compareDecimal(amountUsdc, expected);
     if (cmp < 0) {
-      recordUnmatchedPayment({
+      markPartiallyPaid({
         txid,
         senderAddress,
         paymentAsset,
         amountUsdc,
         amountXlm,
         orderId,
-        reason: 'underpaid_usdc',
+        requiredAmount: expected,
       });
       return;
     }
@@ -348,14 +386,14 @@ async function handlePayment({
     }
     const cmp = compareDecimal(amountXlm, expected);
     if (cmp < 0) {
-      recordUnmatchedPayment({
+      markPartiallyPaid({
         txid,
         senderAddress,
         paymentAsset,
         amountUsdc,
         amountXlm,
         orderId,
-        reason: 'underpaid_xlm',
+        requiredAmount: expected,
       });
       return;
     }
@@ -426,7 +464,7 @@ async function handlePayment({
   }
 
   try {
-    const { vccJobId, paymentUrl, callbackNonce } = await vccClient.getInvoice(
+    const { vccJobId, paymentUrl, callbackNonce } = await _getInvoice(
       orderId,
       order.amount_usdc,
       order.request_id,
@@ -454,17 +492,26 @@ async function handlePayment({
     } catch {
       /* non-critical */
     }
-    db.prepare(
-      `UPDATE orders SET vcc_job_id = ?, callback_nonce = ?, ctx_invoice_xlm = ?,
-       settlement_xlm_usd_rate = ?, updated_at = ? WHERE id = ?`,
-    ).run(
-      vccJobId,
-      callbackNonce,
-      ctxInvoiceXlm,
-      settlementRate,
-      new Date().toISOString(),
-      orderId,
-    );
+    // #979: take the pay lock before paying CTX. The reconciler in jobs.js
+    // retries payCtxOrder on orders whose updated_at has gone stale; if it
+    // got there first it would pay CTX a second time for this order. This
+    // write is a compare-and-set on the updated_at we wrote at claim time
+    // (`now`). If the reconciler re-claimed the row while we were waiting on
+    // vcc, the version no longer matches, so we back off and never pay.
+    const readyAt = new Date().toISOString();
+    const lock = db
+      .prepare(
+        `UPDATE orders SET vcc_job_id = ?, callback_nonce = ?, ctx_invoice_xlm = ?,
+         settlement_xlm_usd_rate = ?, updated_at = ?
+         WHERE id = ? AND status = 'ordering' AND xlm_sent_at IS NULL
+           AND ctx_stellar_txid IS NULL AND updated_at = ?`,
+      )
+      .run(vccJobId, callbackNonce, ctxInvoiceXlm, settlementRate, readyAt, orderId, now);
+    if (lock.changes === 0) {
+      console.error(`[payment] order ${orderId.slice(0, 8)} lost pay lock — not paying CTX`);
+      logger.event('fulfillment.lock_lost', { order_id: orderId, stage: 'handle_payment' });
+      return;
+    }
 
     // Branch Stellar payment on what the agent paid us:
     //   - XLM → forward as-is from treasury (single-op payment)
@@ -508,6 +555,7 @@ async function handlePayment({
                updated_at = ?
            WHERE id = ?`,
         ).run(publicMessage('ctx_payment_ambiguous'), txHash, new Date().toISOString(), orderId);
+        logger.event('order.failed', { order_id: orderId, error: 'ctx_payment_ambiguous' });
         logger.event('ctx.payment_ambiguous', {
           order_id: orderId,
           stellar_status: status,
@@ -533,7 +581,6 @@ async function handlePayment({
     ).run(new Date().toISOString(), ctxTxHash || null, new Date().toISOString(), orderId);
 
     await _notifyPaid(vccJobId);
-    await vccClient.notifyPaid(vccJobId);
     db.prepare(`UPDATE orders SET vcc_notified_at = ?, updated_at = ? WHERE id = ?`).run(
       new Date().toISOString(),
       new Date().toISOString(),
@@ -561,14 +608,12 @@ async function handlePayment({
       new Date().toISOString(),
       orderId,
     );
+    logger.event('order.failed', { order_id: orderId, error: safePublicMessage });
+    // Schedule the refund exactly once. A second call here would queue a
+    // duplicate refund for the same order.
     _refundOrQuarantine(orderId, safePublicMessage).catch((e) =>
       console.error(`[payment] refund error for ${orderId.slice(0, 8)}: ${safeErrorMessage(e)}`),
     );
-    fulfillment
-      .refundOrQuarantine(orderId, safePublicMessage)
-      .catch((e) =>
-        console.error(`[payment] refund error for ${orderId.slice(0, 8)}: ${safeErrorMessage(e)}`),
-      );
   }
 }
 

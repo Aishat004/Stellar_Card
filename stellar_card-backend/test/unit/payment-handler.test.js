@@ -436,7 +436,7 @@ describe('F7-payment-handler: unmatched-payment routing', () => {
     assert.equal(findUnmatched('TX_WRONG_STATUS').reason, 'order_status_ordering');
   });
 
-  it('routes to underpaid_usdc and leaves the order in pending_payment', async () => {
+  it('parks an underpaid USDC order as partially_paid with the balance owed', async () => {
     const orderId = seedOrder({ amountUsdc: '10.00' });
     await handlePayment({
       txid: 'TX_UNDERPAID_USDC',
@@ -446,8 +446,11 @@ describe('F7-payment-handler: unmatched-payment routing', () => {
       senderAddress: 'GTESTSENDER',
       orderId,
     });
-    assert.equal(getOrder(orderId).status, 'pending_payment');
-    assert.equal(findUnmatched('TX_UNDERPAID_USDC').reason, 'underpaid_usdc');
+    const row = getOrder(orderId);
+    assert.equal(row.status, 'partially_paid');
+    assert.equal(row.amount_paid, '5.00');
+    assert.equal(row.balance_due, '5.0000000');
+    assert.equal(findUnmatched('TX_UNDERPAID_USDC'), undefined, 'partial payments are not refunds');
   });
 
   it('routes to xlm_not_quoted when the order never offered an XLM price', async () => {
@@ -464,7 +467,7 @@ describe('F7-payment-handler: unmatched-payment routing', () => {
     assert.equal(findUnmatched('TX_XLM_NOT_QUOTED').reason, 'xlm_not_quoted');
   });
 
-  it('routes to underpaid_xlm and leaves the order in pending_payment', async () => {
+  it('parks an underpaid XLM order as partially_paid with the balance owed', async () => {
     const orderId = seedOrder({ expectedXlmAmount: '100' });
     await handlePayment({
       txid: 'TX_UNDERPAID_XLM',
@@ -474,8 +477,10 @@ describe('F7-payment-handler: unmatched-payment routing', () => {
       senderAddress: 'GTESTSENDER',
       orderId,
     });
-    assert.equal(getOrder(orderId).status, 'pending_payment');
-    assert.equal(findUnmatched('TX_UNDERPAID_XLM').reason, 'underpaid_xlm');
+    const row = getOrder(orderId);
+    assert.equal(row.status, 'partially_paid');
+    assert.equal(row.balance_due, '50.0000000');
+    assert.equal(findUnmatched('TX_UNDERPAID_XLM'), undefined);
   });
 
   it('emits payment.xlm_overpaid and still claims the order on XLM overpayment', async () => {
@@ -733,7 +738,7 @@ describe('Part 4: corrupt_order_amount bizEvent', () => {
     _resetTestHooks();
   });
 
-  it("emits payment.corrupt_order_amount with the offending column", async () => {
+  it('emits payment.corrupt_order_amount with the offending column', async () => {
     const orderId = seedPart4Order({ amountUsdc: '', apiKeyId });
     await handlePayment({
       txid: 'TX_PART4_CORRUPT_EVT',
@@ -748,8 +753,10 @@ describe('Part 4: corrupt_order_amount bizEvent', () => {
     assert.ok(evt, 'expected payment.corrupt_order_amount bizEvent');
     assert.equal(evt.fields.order_id, orderId);
     assert.equal(evt.fields.column, 'amount_usdc');
-    assert.equal(db.prepare(`SELECT status FROM orders WHERE id = ?`).get(orderId).status,
-      'pending_payment');
+    assert.equal(
+      db.prepare(`SELECT status FROM orders WHERE id = ?`).get(orderId).status,
+      'pending_payment',
+    );
   });
 });
 
@@ -896,7 +903,7 @@ describe('Part 4: ambiguous CTX payment parks the order', () => {
     return err;
   }
 
-  it("parks on stellarStatus=unknown with NO auto-refund", async () => {
+  it('parks on stellarStatus=unknown with NO auto-refund', async () => {
     const hash = 'b'.repeat(64);
     xlmSender.payCtxOrder = async () => {
       throw ambiguousError('unknown', hash);
@@ -986,19 +993,8 @@ describe('Part 4: duplicate-claim race branch', () => {
     xlmSender.payCtxOrder = _realPayCtxOrder;
     _resetTestHooks();
   });
+});
 
-  it('records duplicate_payment and never starts fulfillment when the claim loses the race', async () => {
-    const orderId = seedPart4Order({ amountUsdc: '10.00', apiKeyId });
-    const realPrepare = db.prepare;
-    let blockClaim = true;
-    db.prepare = function (sql, ...rest) {
-      const stmt = realPrepare.call(db, sql, ...rest);
-      if (blockClaim && /UPDATE orders\s+SET status = 'ordering'/.test(sql)) {
-        return {
-          run: () => {
-            blockClaim = false;
-            return { changes: 0 };
-          },
 // ── Post-claim pipeline: getInvoice → payCtxOrder → notifyPaid ─────────────
 //
 // Everything above this line covers the decision to *claim* an order: the
@@ -1018,7 +1014,6 @@ describe('Part 4: duplicate-claim race branch', () => {
 // can be substituted directly.
 
 const vccClient = require('../../src/vcc-client');
-const xlmSender = require('../../src/payments/xlm-sender');
 const fulfillment = require('../../src/fulfillment');
 const logger = require('../../src/lib/logger');
 
@@ -1605,15 +1600,19 @@ describe('payment-handler: lost claim race', () => {
 
     assert.equal(
       db.prepare(`SELECT status FROM orders WHERE id = ?`).get(orderId).status,
-      'pending_payment',
-      'losing the claim race must leave the order untouched',
+      'ordering',
+      'the winning claim must stand; the losing event must not touch the order',
     );
     const unmatched = db
       .prepare(`SELECT * FROM unmatched_payments WHERE stellar_txid = ?`)
-      .get('TX_PART4_DUPE_RACE');
+      .get('TX_RACE_LOSER');
     assert.ok(unmatched, 'expected an unmatched_payments row');
     assert.equal(unmatched.reason, 'duplicate_payment');
-    assert.equal(invoiceCalls, 0, 'fulfillment must not start after a lost claim');
+    assert.equal(
+      db.prepare(`SELECT vcc_job_id FROM orders WHERE id = ?`).get(orderId).vcc_job_id,
+      null,
+      'fulfillment must not start after a lost claim',
+    );
   });
 });
 
@@ -1657,7 +1656,7 @@ describe('Part 4: stroop-precision amount boundaries', () => {
     });
   }
 
-  it("claims on trailing-zero 7-decimal equivalence without an overpaid event", async () => {
+  it('claims on trailing-zero 7-decimal equivalence without an overpaid event', async () => {
     const orderId = seedPart4Order({ amountUsdc: '10.00', apiKeyId });
     await payExactBoundary(orderId, '10.0000000', 'TX_PART4_PREC_EXACT');
 
@@ -1693,16 +1692,9 @@ describe('Part 4: stroop-precision amount boundaries', () => {
     const orderId = seedPart4Order({ amountUsdc: '10.00', apiKeyId });
     await payExactBoundary(orderId, '9.9999999', 'TX_PART4_PREC_UNDER');
 
-    assert.equal(
-      db.prepare(`SELECT status FROM orders WHERE id = ?`).get(orderId).status,
-      'pending_payment',
-    );
-    assert.equal(
-      db.prepare(`SELECT reason FROM unmatched_payments WHERE stellar_txid = ?`).get(
-        'TX_PART4_PREC_UNDER',
-      ).reason,
-      'underpaid_usdc',
-    );
+    const row = db.prepare(`SELECT status, balance_due FROM orders WHERE id = ?`).get(orderId);
+    assert.equal(row.status, 'partially_paid');
+    assert.equal(row.balance_due, '0.0000001');
   });
 
   it('truncates sub-stroop dust instead of tipping the comparison', async () => {
@@ -1720,10 +1712,74 @@ describe('Part 4: stroop-precision amount boundaries', () => {
       0,
       'sub-stroop dust must not emit overpaid',
     );
-    const unmatched = db
-      .prepare(`SELECT * FROM unmatched_payments WHERE stellar_txid = 'TX_RACE_LOSER'`)
-      .get();
-    assert.ok(unmatched, 'the losing event must be recorded for refund');
-    assert.equal(unmatched.reason, 'duplicate_payment');
+  });
+});
+
+// ── #979: pay lock against the reconciler ───────────────────────────────────
+describe('payment-handler: pay lock against the reconciler (#979)', () => {
+  let apiKeyId;
+
+  beforeEach(async () => {
+    resetDb();
+    const key = await createTestKey({ label: 'pay-lock' });
+    apiKeyId = key.id;
+  });
+
+  it('does not pay CTX when the row was re-claimed while getInvoice was in flight', async () => {
+    const orderId = uuidv4();
+    db.prepare(
+      `INSERT INTO orders (id, status, amount_usdc, payment_asset, api_key_id, request_id, created_at, updated_at)
+       VALUES (?, 'pending_payment', '10.00', 'usdc', ?, 'req-lock', datetime('now'), datetime('now'))`,
+    ).run(orderId, apiKeyId);
+
+    let payCalls = 0;
+    await withStubs(
+      [
+        [
+          vccClient,
+          'getInvoice',
+          async () => {
+            // The reconciler claims the row while we are waiting on vcc.
+            db.prepare(`UPDATE orders SET updated_at = ? WHERE id = ?`).run(
+              '2099-01-01T00:00:00.000Z',
+              orderId,
+            );
+            return {
+              vccJobId: 'VCC_JOB_LOCK',
+              paymentUrl: 'stellar:pay?destination=GCTX&amount=12.5&memo=lock',
+              callbackNonce: 'nonce-lock',
+            };
+          },
+        ],
+        [vccClient, 'notifyPaid', async () => ({})],
+        [
+          xlmSender,
+          'payCtxOrder',
+          async () => {
+            payCalls++;
+            return 'CTX_TX_LOCK';
+          },
+        ],
+      ],
+      async () => {
+        await handlePayment({
+          txid: 'TX_LOCK_LOSER',
+          paymentAsset: 'usdc_soroban',
+          amountUsdc: '10.00',
+          amountXlm: null,
+          senderAddress: 'GSENDER',
+          orderId,
+        });
+      },
+    );
+
+    assert.equal(payCalls, 0, 'the handler must not pay CTX after losing the lock');
+    const row = db.prepare(`SELECT status, xlm_sent_at FROM orders WHERE id = ?`).get(orderId);
+    assert.equal(
+      row.status,
+      'ordering',
+      'the lock winner owns the order; the handler must not fail it',
+    );
+    assert.equal(row.xlm_sent_at, null);
   });
 });

@@ -1088,7 +1088,14 @@ if (!consecutiveFailures) {
  * @param {number} [opts.offset=0] - Result offset
  * @returns {Array<Object>} List of matching order records
  */
-function listOrders({ apiKeyId, status, sinceCreatedAt, sinceUpdatedAt, limit = 50, offset = 0 } = {}) {
+function listOrders({
+  apiKeyId,
+  status,
+  sinceCreatedAt,
+  sinceUpdatedAt,
+  limit = 50,
+  offset = 0,
+} = {}) {
   if (!apiKeyId) {
     throw new TypeError('listOrders: apiKeyId is required');
   }
@@ -1248,4 +1255,3 @@ db.listOrdersCursor = listOrdersCursor;
 db.explainListOrdersPlan = explainListOrdersPlan;
 
 module.exports = db;
-
