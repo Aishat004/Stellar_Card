@@ -1,17 +1,27 @@
 // @ts-check
 // Shared API key authentication middleware for /v1 routes.
 // Uses key_prefix for O(1) candidate lookup, then bcrypt for verification.
-// Key format: stellar_card_<48 random hex chars>; key_prefix = chars 9-21 of the key.
+//
+// Two key formats are accepted:
+//   v2 (new):    sk_{live|test}_{32 random hex}{6 hex CRC32 checksum}  (46 chars)
+//   v1 (legacy): stellar_card_{48 random hex chars}                     (57 chars)
+//
+// v2 keys are validated for format AND CRC32 checksum before the DB is
+// touched; a corrupted or mistyped key is rejected immediately with no
+// bcrypt work and no SQL — O(1) early exit at negligible CPU cost.
 
 const bcrypt = require('bcryptjs');
 const db = require('../db');
+const { validateApiKeyFormat } = require('../lib/api-key');
 
-// stellar_card_<48 hex> → 9 + 48 = 57 chars exactly. We allow the header
-// to be slightly shorter (down to 21 chars = prefix region) so
-// obviously-truncated keys still route through the prefix index rather
-// than falling back to a full-table bcrypt scan (a DoS amplifier pre-F).
-const KEY_MIN_LENGTH = 21; // stellar_card_ (9) + 12-char prefix
-const KEY_MAX_LENGTH = 128; // anything longer is either wrong or hostile
+// Legacy v1 format constants (unchanged).
+const LEGACY_PREFIX = 'stellar_card_';
+const LEGACY_KEY_MIN_LENGTH = 21; // stellar_card_ (13) + 12-char prefix minimum
+const LEGACY_KEY_MAX_LENGTH = 128;
+
+// v2 key is exactly: sk_live_ (8) + 32 payload + 6 checksum = 46 chars.
+// Allow ±2 for future format revisions but reject anything obviously wrong.
+const V2_KEY_LENGTH = 46;
 
 // Cap on candidate rows per auth attempt. The prefix is 12 hex chars =
 // 48 bits of entropy, so accidental collisions are effectively zero; a
@@ -55,18 +65,32 @@ module.exports = async function auth(req, res, next) {
   if (typeof rawKey !== 'string') return res.status(401).json({ error: 'invalid_api_key' });
   const key = rawKey;
 
-  // Early rejections — no DB work, no bcrypt work. A malformed key used
-  // to trigger a full-table scan with a bcrypt compare against every row,
-  // which let an attacker turn one HTTP request into O(n) bcrypt work on
-  // our box. Now we bail before touching the DB.
-  if (
-    !key.startsWith('stellar_card_') ||
-    key.length < KEY_MIN_LENGTH ||
-    key.length > KEY_MAX_LENGTH
-  ) {
+  // ── Early rejection: format + checksum, no DB work ──────────────────────
+  //
+  // Determine which format the key claims to be. Any key that doesn't match
+  // either known format is rejected immediately — no SQL, no bcrypt.
+  //
+  // For v2 keys (sk_live_ / sk_test_) we also verify the CRC32 checksum
+  // here. A corrupted or mistyped key with the right prefix but a wrong
+  // checksum is rejected in O(1) time before the DB is opened.
+  let keyPrefix;
+
+  if (key.startsWith('sk_live_') || key.startsWith('sk_test_')) {
+    // v2 format — validate structure and CRC32.
+    const result = validateApiKeyFormat(key);
+    if (!result.valid) {
+      return res.status(401).json({ error: 'invalid_api_key' });
+    }
+    keyPrefix = result.prefix;
+  } else if (key.startsWith(LEGACY_PREFIX)) {
+    // v1 legacy format — length guard only, no checksum.
+    if (key.length < LEGACY_KEY_MIN_LENGTH || key.length > LEGACY_KEY_MAX_LENGTH) {
+      return res.status(401).json({ error: 'invalid_api_key' });
+    }
+    keyPrefix = key.slice(13, 25); // stellar_card_ is 13 chars; take next 12
+  } else {
     return res.status(401).json({ error: 'invalid_api_key' });
   }
-  const keyPrefix = key.slice(9, 21);
 
   // Use the prefix index to narrow candidates. The `key_prefix IS NULL`
   // fallback catches any legacy rows created before the column existed
