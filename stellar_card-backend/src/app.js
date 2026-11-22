@@ -48,6 +48,7 @@
 const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const { log } = require('./lib/logger');
 const {
   sentryRequestHandler,
