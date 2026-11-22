@@ -226,9 +226,39 @@ function percentile(sorted, pct) {
   return sorted[Math.max(0, Math.min(idx, sorted.length - 1))];
 }
 
+/**
+ * Dead-letter log: webhook deliveries that exhausted their retry budget.
+ *
+ * The retry worker (jobs.js::retryWebhooks) abandons a row by leaving it
+ * undelivered with attempts above the ceiling, so webhook_queue is the
+ * durable dead-letter record and the retry worker is the writer. This is the
+ * read side. Payloads are not returned: they are card-redacted but still
+ * customer data.
+ *
+ * @param {{ limit?: number }} [opts]
+ * @returns {{ id: string; url: string; attempts: number; last_error: string | null; created_at: string }[]}
+ */
+function listDeadLetters(opts = {}) {
+  // Lazy require: fulfillment.js requires this module at call time.
+  const { getWebhookMaxAttempts } = require('../fulfillment');
+  const limit = Math.min(Math.max(1, opts.limit ?? 50), 200);
+  return /** @type {any[]} */ (
+    db
+      .prepare(
+        `SELECT id, url, attempts, last_error, created_at
+         FROM webhook_queue
+         WHERE delivered = 0 AND attempts > ?
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .all(getWebhookMaxAttempts(), limit)
+  );
+}
+
 module.exports = {
   recordWebhookDelivery,
   listDeliveries,
+  listDeadLetters,
   deliverySuccessRate24h,
   deliveryLatencyStats24h,
   /** @internal — exported for unit tests only */
