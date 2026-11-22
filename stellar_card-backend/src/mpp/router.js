@@ -21,11 +21,17 @@ const { buildDiscoveryDoc, buildChallengeBody, buildWwwAuthenticate } = require(
 const { verifyAndCreateMppOrder } = require('./verify');
 const { waitForDelivery } = require('./wait-for-delivery');
 
-// Rate limiters for public endpoints
+// Rate limiters for public endpoints.
+//
+// ipKeyGenerator takes an IP string, not the request. Passing `req` returns
+// a fresh object per call, so the store never matches a previous hit and the
+// limit never trips. Always pass req.ip.
+const ipKey = (/** @type {any} */ req) => ipKeyGenerator(req.ip || 'unknown');
+
 const discoveryLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 60,
-  keyGenerator: (/** @type {any} */ req) => ipKeyGenerator(req),
+  keyGenerator: ipKey,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
 });
@@ -33,7 +39,7 @@ const discoveryLimiter = rateLimit({
 const receiptLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 60,
-  keyGenerator: (/** @type {any} */ req) => ipKeyGenerator(req),
+  keyGenerator: ipKey,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   handler: (_req, res) =>
@@ -47,10 +53,17 @@ const receiptLimiter = rateLimit({
 // must never be a free DoS amplifier — each GET creates a row in
 // mpp_challenges, so we need a ceiling. 30/min/IP is plenty for a
 // legitimate agent and cheap to enforce.
+// A non-numeric MPP_CHALLENGE_RATE_LIMIT must not disable the limit
+// (NaN never trips the check), so fall back to the default instead.
+const CHALLENGE_RATE_LIMIT_DEFAULT = 30;
+const challengeRateLimit = Number.parseInt(process.env.MPP_CHALLENGE_RATE_LIMIT ?? '', 10);
 const challengeLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: parseInt(process.env.MPP_CHALLENGE_RATE_LIMIT || '30', 10),
-  keyGenerator: (/** @type {any} */ req) => ipKeyGenerator(req),
+  limit:
+    Number.isFinite(challengeRateLimit) && challengeRateLimit > 0
+      ? challengeRateLimit
+      : CHALLENGE_RATE_LIMIT_DEFAULT,
+  keyGenerator: ipKey,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   handler: (_req, res) =>
