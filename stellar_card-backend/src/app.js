@@ -263,10 +263,37 @@ app.use(
   }),
 );
 
-// Capture raw body for HMAC signature verification (used by /vcc-callback)
+// Capture raw body for HMAC signature verification (used by /vcc-callback).
+//
+// The default body-size cap is 50 KB, which is generous for every standard
+// endpoint. The /v1/orders/batch path is the only exception; it receives an
+// array of order objects and is allowed up to 500 KB. That larger parser is
+// mounted specifically on that path BEFORE this global one, so Express uses
+// the first matching body-parser and skips the second (the body has already
+// been consumed).
+//
+// When the body exceeds the active limit, body-parser emits a
+// PayloadTooLargeError with `.status = 413`. The errorHandler middleware
+// (mounted last) catches it and responds with:
+//   HTTP/1.1 413 Payload Too Large
+//   Connection: close          ← ensures the client TCP connection is torn
+//                                 down and cannot be reused for another
+//                                 oversized request on the same keep-alive
+//                                 connection.
+//   { "error": "entity.too.large", "message": "..." }
+app.use(
+  '/v1/orders/batch',
+  express.json({
+    limit: '500kb',
+    verify: (/** @type {any} */ req, _res, buf) => {
+      req.rawBody = buf.toString();
+    },
+  }),
+);
+
 app.use(
   express.json({
-    limit: '64kb',
+    limit: '50kb',
     verify: (/** @type {any} */ req, _res, buf) => {
       req.rawBody = buf.toString();
     },

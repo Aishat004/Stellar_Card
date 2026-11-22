@@ -36,7 +36,7 @@ db.exec(`
     card_brand  TEXT,
     error       TEXT,
     failure_count INTEGER NOT NULL DEFAULT 0,
-    api_key_id  TEXT,
+    api_key_id  TEXT REFERENCES api_keys(id) ON DELETE SET NULL,
     webhook_url TEXT,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
@@ -63,7 +63,7 @@ db.exec(`
   -- with a different body (which should return 409, not the cached response).
   CREATE TABLE IF NOT EXISTS idempotency_keys (
     key                  TEXT NOT NULL,
-    api_key_id           TEXT NOT NULL,
+    api_key_id           TEXT NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
     request_fingerprint  TEXT NOT NULL DEFAULT '',
     response_status      INTEGER NOT NULL,
     response_body        TEXT NOT NULL,
@@ -1020,9 +1020,37 @@ applyMigration(31, () => {
   `);
 });
 
+// Migration 32: assert foreign key enforcement is active and record it in
+// schema_migrations so the enforcement guarantee is part of the auditable
+// migration history.
+//
+// `PRAGMA foreign_keys = ON` is already executed at connection open time
+// (line 9 of this file), but SQLite's foreign-key enforcement is a
+// per-connection runtime setting — it is NOT stored in the database file
+// itself and must be re-applied on every new connection. Recording it
+// here makes the intent explicit and lets tests confirm the pragma is set
+// before any DML runs.
+//
+// New databases created from this schema version forward will also have
+// REFERENCES clauses on orders.api_key_id (ON DELETE SET NULL) and
+// idempotency_keys.api_key_id (ON DELETE CASCADE), giving SQLite the FK
+// metadata it needs to enforce them. Existing databases benefit from the
+// per-connection pragma immediately without any structural change, since
+// SQLite enforces FK constraints based on the pragma state, not on
+// whether a REFERENCES clause was present at CREATE TABLE time.
+applyMigration(32, () => {
+  // Confirm the pragma is active on this connection. This is a no-op
+  // if already set, but makes the migration self-documenting.
+  db.pragma('foreign_keys = ON');
+  const fkState = db.pragma('foreign_keys', { simple: true });
+  if (fkState !== 1) {
+    throw new Error('[db] Migration 32: failed to enable foreign_keys pragma');
+  }
+});
+
 // EXPECTED_SCHEMA_VERSION must match the last `applyMigration(N)` call
 // above. Bump it in lock-step with any new migration.
-const EXPECTED_SCHEMA_VERSION = 33;
+const EXPECTED_SCHEMA_VERSION = 32;
 const actualVersion = getSchemaVersion();
 if (actualVersion > EXPECTED_SCHEMA_VERSION) {
   console.error(

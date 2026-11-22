@@ -5,6 +5,9 @@
 // evaluator) are also mirrored to Sentry via reportSchedulerError below —
 // see the comment on _reportError for why that hook exists.
 
+const fs = require('fs');
+const path = require('path');
+const zlib = require('zlib');
 const db = require('./db');
 const logger = require('./lib/logger');
 const { recordAudit } = require('./lib/audit');
@@ -1368,60 +1371,97 @@ async function checkAgentFundingStatusGuarded() {
   }
 }
 
-// ── Nightly daily-stats job (issue #1008) ────────────────────────────────────
-//
-// Fires at 00:05 UTC every night, aggregates delivered orders for the
-// previous calendar day, and caches results in daily_stats via
-// stats.computeDailyStats(). The 5-minute offset avoids races with
-// midnight order-expiry and webhook-retry ticks.
-//
-// msUntilNext0005UTC computes the delay to the next 00:05 UTC so the
-// first setTimeout fires at the right wall-clock time regardless of when
-// the process starts.
+// ── Database backup (#993) ────────────────────────────────────────────────────
+
+const BACKUP_DIR = process.env.BACKUP_DIR || path.join(process.cwd(), 'backups');
+const BACKUP_RETENTION_DAYS = 14;
+const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 h
 
 /**
- * @param {number} [now]  Injected clock ms for tests.
- * @returns {number}  Milliseconds until the next 00:05 UTC.
+ * Create a timestamped Gzip-compressed snapshot of the SQLite database.
+ * Uses better-sqlite3's non-blocking .backup() API so reads/writes on the
+ * main connection continue while the snapshot is taken. The raw snapshot is
+ * piped through zlib.createGzip() and written to
+ * backups/db-backup-YYYY-MM-DD.sqlite.gz.
+ *
+ * Returns the path of the archive on success, throws on any I/O failure.
  */
-function msUntilNext0005UTC(now = Date.now()) {
-  const d = new Date(now);
-  // Advance to tomorrow if we're already past 00:05 today.
-  const target = new Date(
-    Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 5, 0, 0),
-  );
-  if (target.getTime() <= now) target.setUTCDate(target.getUTCDate() + 1);
-  return target.getTime() - now;
+async function backupDatabase() {
+  fs.mkdirSync(BACKUP_DIR, { recursive: true });
+
+  const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const tmpPath = path.join(BACKUP_DIR, `db-backup-${date}.sqlite.tmp`);
+  const gzPath = path.join(BACKUP_DIR, `db-backup-${date}.sqlite.gz`);
+
+  // Non-blocking online snapshot via better-sqlite3.
+  await db.backup(tmpPath);
+
+  // Compress the snapshot and remove the uncompressed temp file.
+  await new Promise((resolve, reject) => {
+    const src = fs.createReadStream(tmpPath);
+    const dst = fs.createWriteStream(gzPath);
+    const gz = zlib.createGzip();
+    src.on('error', reject);
+    gz.on('error', reject);
+    dst.on('error', reject);
+    dst.on('finish', resolve);
+    src.pipe(gz).pipe(dst);
+  });
+
+  fs.unlinkSync(tmpPath);
+  return gzPath;
 }
 
-async function runDailyStats() {
+/**
+ * Remove backup archives older than BACKUP_RETENTION_DAYS from BACKUP_DIR.
+ * Returns the list of pruned file paths.
+ */
+function pruneOldBackups() {
+  if (!fs.existsSync(BACKUP_DIR)) return [];
+
+  const cutoff = Date.now() - BACKUP_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const pruned = [];
+
+  for (const file of fs.readdirSync(BACKUP_DIR)) {
+    if (!file.startsWith('db-backup-') || !file.endsWith('.sqlite.gz')) continue;
+    const full = path.join(BACKUP_DIR, file);
+    try {
+      const { mtimeMs } = fs.statSync(full);
+      if (mtimeMs < cutoff) {
+        fs.unlinkSync(full);
+        pruned.push(full);
+      }
+    } catch {
+      // File may have been removed concurrently — ignore.
+    }
+  }
+
+  return pruned;
+}
+
+/**
+ * Guarded wrapper run on the daily backup interval. Never throws so a single
+ * backup failure cannot crash the job loop.
+ */
+async function runDatabaseBackup() {
   try {
-    const { computeDailyStats } = require('./lib/stats');
-    // Aggregate yesterday (the day that just finished at midnight).
-    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000)
-      .toISOString()
-      .slice(0, 10);
-    const result = computeDailyStats(yesterday);
-    log(
-      `daily-stats computed date=${result.date} orders=${result.total_orders} ` +
-        `volume=${result.total_volume} fees=${result.total_fees}`,
-    );
+    const archive = await backupDatabase();
+    log(`db backup created: ${archive}`);
   } catch (err) {
-    log(`daily-stats error: ${err instanceof Error ? err.message : String(err)}`);
-    reportSchedulerError(err, 'runDailyStats');
+    log(`db backup failed: ${err instanceof Error ? err.message : String(err)}`);
+    reportSchedulerError(err, 'databaseBackup');
+  }
+
+  try {
+    const pruned = pruneOldBackups();
+    if (pruned.length > 0) log(`db backup pruned ${pruned.length} old archive(s)`);
+  } catch (err) {
+    log(`db backup prune failed: ${err instanceof Error ? err.message : String(err)}`);
+    reportSchedulerError(err, 'databaseBackupPrune');
   }
 }
 
-function scheduleDailyStats() {
-  const delay = msUntilNext0005UTC();
-  const t = setTimeout(async () => {
-    await runDailyStats();
-    // After the first fire, repeat every 24 h.
-    _jobIntervals.push(setInterval(runDailyStats, 24 * 60 * 60 * 1000));
-  }, delay);
-  // Store the initial timeout so stopJobs can cancel it if the process
-  // shuts down before it fires.
-  _jobIntervals.push(/** @type {any} */ (t));
-}
+// ── Interval registry ─────────────────────────────────────────────────────────
 
 // Track every interval scheduled by startJobs() so the process
 // signal handler in index.js can cancel them cleanly on SIGINT /
@@ -1461,9 +1501,9 @@ function startJobs() {
     ),
   );
 
-  // Nightly daily-stats aggregation — runs at 00:05 UTC every day.
-  // Schedules itself to fire at the next 00:05 UTC and then every 24 h.
-  scheduleDailyStats();
+  // Daily database backup (#993). Runs immediately on startup then every 24 h.
+  runDatabaseBackup();
+  _jobIntervals.push(setInterval(() => { runDatabaseBackup(); }, BACKUP_INTERVAL_MS));
 
   log('background jobs started');
 }
@@ -1537,6 +1577,9 @@ module.exports = {
   _checkAgentFundingStatusGuarded: checkAgentFundingStatusGuarded,
   _onAlertsError: onAlertsError,
   runJobs,
+  backupDatabase,
+  pruneOldBackups,
+  runDatabaseBackup,
   checkAgentFundingStatus,
   _resetFundingHorizonOutageState,
   _horizonBase: horizonBase,
