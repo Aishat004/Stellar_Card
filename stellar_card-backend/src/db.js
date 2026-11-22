@@ -1166,6 +1166,27 @@ applyMigration(32, () => {
     if (!e.message.includes('duplicate column')) throw e;
   }
 });
+
+// Migration 33: daily_stats table for nightly order volume and revenue summary.
+//
+// The nightly job in jobs.js (runDailyStats) aggregates delivered orders by
+// calendar date (UTC) and caches the results here so dashboard queries are
+// O(1) lookups rather than full-table scans. The PRIMARY KEY on `date` makes
+// every INSERT OR REPLACE idempotent — re-running the job for the same date
+// overwrites the previous result without leaving duplicates.
+applyMigration(33, () => {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS daily_stats (
+      date            TEXT PRIMARY KEY,  -- ISO date, e.g. '2026-11-22'
+      total_orders    INTEGER NOT NULL DEFAULT 0,
+      total_volume    TEXT NOT NULL DEFAULT '0',  -- USDC as decimal string
+      total_fees      TEXT NOT NULL DEFAULT '0',  -- USDC as decimal string
+      computed_at     TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_daily_stats_date ON daily_stats(date DESC);
+  `);
+});
+
 /**
  * Cursor-based (keyset) variant of listOrders.  Accepts an optional
  * `startingAfter` decoded cursor ({ created_at, id }) that anchors the query

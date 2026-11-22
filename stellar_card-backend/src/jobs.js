@@ -1584,4 +1584,7 @@ module.exports = {
   _resetFundingHorizonOutageState,
   _horizonBase: horizonBase,
   _MAINNET_USDC_ISSUER: MAINNET_USDC_ISSUER,
+  // Daily-stats job exports (issue #1008).
+  _runDailyStats: runDailyStats,
+  _msUntilNext0005UTC: msUntilNext0005UTC,
 };

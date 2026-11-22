@@ -168,4 +168,75 @@ function getOrderStats(opts = {}) {
   );
 }
 
-module.exports = { getOrderStats };
+// ── Daily stats aggregation (issue #1008) ─────────────────────────────────────
+//
+// computeDailyStats runs the aggregation for a single UTC calendar date and
+// writes (or overwrites) the result into daily_stats via INSERT OR REPLACE so
+// re-runs are idempotent. Only 'delivered' orders count toward volume and fees;
+// failed/expired orders never moved money.
+//
+// Platform fee is modelled as 1 % of delivered volume (PLATFORM_FEE_RATE env
+// var, default 0.01). The fee column is informational — it is not deducted
+// anywhere in the payment flow.
+//
+// getDailyStats returns cached rows ordered newest-first. If a row for today
+// has not been computed yet it returns the most-recent available rows so the
+// dashboard never shows an empty state on the morning of a new day.
+
+const PLATFORM_FEE_RATE = parseFloat(process.env.PLATFORM_FEE_RATE || '0.01');
+
+/**
+ * Aggregate order volume and fee revenue for a single UTC date and persist
+ * the result to daily_stats. Idempotent — safe to re-run for the same date.
+ *
+ * @param {string} [date]  ISO date string, e.g. '2026-11-22'. Defaults to today UTC.
+ * @returns {{ date: string, total_orders: number, total_volume: string, total_fees: string }}
+ */
+function computeDailyStats(date) {
+  const target = date || new Date().toISOString().slice(0, 10);
+
+  const row = /** @type {any} */ (
+    db
+      .prepare(
+        `SELECT
+          COUNT(*) AS total_orders,
+          COALESCE(SUM(CASE WHEN status = 'delivered' THEN CAST(amount_usdc AS REAL) ELSE 0 END), 0) AS volume
+        FROM orders
+        WHERE date(created_at) = ?`,
+      )
+      .get(target)
+  );
+
+  const volume = parseFloat(row.volume) || 0;
+  const fees = volume * PLATFORM_FEE_RATE;
+
+  const result = {
+    date: target,
+    total_orders: row.total_orders,
+    total_volume: volume.toFixed(6),
+    total_fees: fees.toFixed(6),
+  };
+
+  db
+    .prepare(
+      `INSERT OR REPLACE INTO daily_stats (date, total_orders, total_volume, total_fees, computed_at)
+       VALUES (?, ?, ?, ?, datetime('now'))`,
+    )
+    .run(result.date, result.total_orders, result.total_volume, result.total_fees);
+
+  return result;
+}
+
+/**
+ * Fetch cached daily stats rows, newest first.
+ *
+ * @param {number} [limit]  Number of rows to return (default 30).
+ * @returns {Array<{ date: string, total_orders: number, total_volume: string, total_fees: string, computed_at: string }>}
+ */
+function getDailyStats(limit = 30) {
+  return /** @type {any[]} */ (
+    db.prepare(`SELECT * FROM daily_stats ORDER BY date DESC LIMIT ?`).all(limit)
+  );
+}
+
+module.exports = { getOrderStats, computeDailyStats, getDailyStats };
