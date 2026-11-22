@@ -32,6 +32,7 @@ const {
   batchDeliveredCounts,
   STATE_LABELS,
   _resetWarnedStates,
+  reserveAgentSpend,
 } = require('../../src/lib/agent-state');
 
 // Build an ephemeral api_keys-shaped object without touching the DB —
@@ -308,5 +309,75 @@ describe('F3-agent-state: frozen STATE_LABELS', () => {
       assert.equal(typeof STATE_LABELS[k], 'string');
       assert.ok(STATE_LABELS[k].length > 0);
     }
+  });
+});
+
+describe('reserveAgentSpend — atomic spend-limit reservation', () => {
+  beforeEach(() => resetDb());
+
+  it('allows any amount for a key with no spend limit and runs the callback', async () => {
+    const key = await createTestKey({ spendLimit: null });
+    let ran = false;
+    const r = reserveAgentSpend(key.id, '500.00', () => {
+      ran = true;
+      return 'inserted';
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.result, 'inserted');
+    assert.equal(ran, true);
+  });
+
+  it('counts in-flight orders and rejects without running the callback', async () => {
+    const key = await createTestKey({ spendLimit: '100.00' });
+    seedOrder({ api_key_id: key.id, status: 'pending_payment', amount_usdc: '60.00' });
+    let ran = false;
+    const r = reserveAgentSpend(key.id, '50.00', () => {
+      ran = true;
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'spend_limit_exceeded');
+    assert.equal(r.limit, '100.00');
+    assert.equal(ran, false, 'callback must not run for a rejected reservation');
+  });
+
+  it('allows an amount that lands exactly on the limit', async () => {
+    const key = await createTestKey({ spendLimit: '100.00' });
+    seedOrder({ api_key_id: key.id, status: 'ordering', amount_usdc: '60.00' });
+    const exact = reserveAgentSpend(key.id, '40.00', () =>
+      seedOrder({ api_key_id: key.id, status: 'pending_payment', amount_usdc: '40.00' }),
+    );
+    assert.equal(exact.ok, true);
+    assert.equal(reserveAgentSpend(key.id, '0.01').reason, 'spend_limit_exceeded');
+  });
+
+  it('counts settled spend from total_spent_usdc', async () => {
+    const key = await createTestKey({ spendLimit: '100.00' });
+    db.prepare(`UPDATE api_keys SET total_spent_usdc = '90.00' WHERE id = ?`).run(key.id);
+    assert.equal(reserveAgentSpend(key.id, '10.01').reason, 'spend_limit_exceeded');
+    assert.equal(reserveAgentSpend(key.id, '10.00').ok, true);
+  });
+
+  it('ignores orders that are not in flight or settled', async () => {
+    const key = await createTestKey({ spendLimit: '50.00' });
+    for (const status of ['expired', 'rejected', 'failed']) {
+      seedOrder({ api_key_id: key.id, status, amount_usdc: '40.00' });
+    }
+    assert.equal(reserveAgentSpend(key.id, '50.00').ok, true);
+  });
+
+  it('a second reservation sees the first one as in flight once its order is written', async () => {
+    const key = await createTestKey({ spendLimit: '30.00' });
+    const first = reserveAgentSpend(key.id, '20.00', () =>
+      seedOrder({ api_key_id: key.id, status: 'pending_payment', amount_usdc: '20.00' }),
+    );
+    assert.equal(first.ok, true);
+    assert.equal(reserveAgentSpend(key.id, '20.00').reason, 'spend_limit_exceeded');
+  });
+
+  it('returns not_found for an unknown key and invalid_amount for a non-positive amount', async () => {
+    assert.equal(reserveAgentSpend('no-such-key', '1.00').reason, 'not_found');
+    const key = await createTestKey({ spendLimit: '100.00' });
+    assert.equal(reserveAgentSpend(key.id, '0').reason, 'invalid_amount');
+    assert.equal(reserveAgentSpend(key.id, 'abc').reason, 'invalid_amount');
   });
 });

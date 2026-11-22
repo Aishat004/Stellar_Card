@@ -8,10 +8,51 @@
 // traffic.
 
 const crypto = require('crypto');
+const { z } = require('zod');
 const db = require('../db');
 
 const CHALLENGE_ID_PREFIX = 'mpp_c_';
 const RECEIPT_ID_PREFIX = 'mpp_r_';
+
+// ── Request validation ───────────────────────────────────────────────────
+// Rejects malformed challenge requests before any row is written. Error
+// codes are part of the public contract and must not change.
+const AMOUNT_RE = /^\d+(?:\.\d{1,2})?$/;
+const MIN_AMOUNT = 0.01;
+const MAX_AMOUNT = 10_000.0;
+
+const CHALLENGE_ERROR_MESSAGES = Object.freeze({
+  invalid_amount: 'Amount must be a decimal like "10" or "10.00" with up to 2 decimal places.',
+  amount_out_of_bounds: `Amount must be between ${MIN_AMOUNT} and ${MAX_AMOUNT} USDC.`,
+});
+
+const ChallengeRequestSchema = z.object({
+  amount: z
+    .string()
+    .regex(AMOUNT_RE, 'invalid_amount')
+    .refine(
+      (s) => {
+        const n = parseFloat(s);
+        return Number.isFinite(n) && n >= MIN_AMOUNT && n <= MAX_AMOUNT;
+      },
+      { message: 'amount_out_of_bounds' },
+    ),
+});
+
+/**
+ * Validate the path parameters of GET /v1/cards/visa/:amount.
+ * @param {{ amount: unknown }} params
+ * @returns {{ ok: true, amount: string } | { ok: false, error: string, message: string }}
+ */
+function parseChallengeRequest(params) {
+  const result = ChallengeRequestSchema.safeParse(params);
+  if (result.success) return { ok: true, amount: result.data.amount };
+  // Regex failures come first in issue order, so the first issue is the
+  // most specific reason.
+  const code = result.error.issues[0]?.message ?? 'invalid_amount';
+  const error = code in CHALLENGE_ERROR_MESSAGES ? code : 'invalid_amount';
+  return { ok: false, error, message: CHALLENGE_ERROR_MESSAGES[error] };
+}
 
 /**
  * Generate a new challenge id. 24 bytes of entropy encoded as base32
@@ -186,6 +227,7 @@ function sweepExpiredChallenges() {
 module.exports = {
   CHALLENGE_ID_PREFIX,
   RECEIPT_ID_PREFIX,
+  parseChallengeRequest,
   generateChallengeId,
   generateReceiptId,
   createChallenge,
