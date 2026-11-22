@@ -1050,7 +1050,7 @@ applyMigration(32, () => {
 
 // EXPECTED_SCHEMA_VERSION must match the last `applyMigration(N)` call
 // above. Bump it in lock-step with any new migration.
-const EXPECTED_SCHEMA_VERSION = 32;
+const EXPECTED_SCHEMA_VERSION = 34;
 const actualVersion = getSchemaVersion();
 if (actualVersion > EXPECTED_SCHEMA_VERSION) {
   console.error(
@@ -1151,22 +1151,6 @@ function explainListOrdersPlan(opts = {}) {
   return db.prepare(`EXPLAIN QUERY PLAN ${query}`).all(...params);
 }
 
-// Migration 32: webhook event subscription filter per api key.
-//
-// Agents may now subscribe only to specific event types (e.g. only
-// order.fulfilled and order.failed) instead of receiving all events.
-// The column stores a JSON array of event-type strings, or NULL / '*'
-// to mean "all events" (the previous and default behaviour).
-applyMigration(32, () => {
-  try {
-    db.prepare(
-      `ALTER TABLE api_keys ADD COLUMN webhook_event_filter TEXT`,
-    ).run();
-  } catch (e) {
-    if (!e.message.includes('duplicate column')) throw e;
-  }
-});
-
 // Migration 33: daily_stats table for nightly order volume and revenue summary.
 //
 // The nightly job in jobs.js (runDailyStats) aggregates delivered orders by
@@ -1185,6 +1169,22 @@ applyMigration(33, () => {
     );
     CREATE INDEX IF NOT EXISTS idx_daily_stats_date ON daily_stats(date DESC);
   `);
+});
+
+// Migration 34: webhook event subscription filter per api key.
+//
+// Agents may now subscribe only to specific event types (e.g. only
+// order.fulfilled and order.failed) instead of receiving all events.
+// The column stores a JSON array of event-type strings, or NULL / '*'
+// to mean "all events" (the previous and default behaviour).
+applyMigration(34, () => {
+  try {
+    db.prepare(
+      `ALTER TABLE api_keys ADD COLUMN webhook_event_filter TEXT`,
+    ).run();
+  } catch (e) {
+    if (!e.message.includes('duplicate column')) throw e;
+  }
 });
 
 /**

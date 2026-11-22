@@ -12,6 +12,7 @@
 // bounded-wait fulfillment handoff.
 
 const { Router } = require('express');
+const { STATUS_CODES } = require('http');
 const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const { event: bizEvent } = require('../lib/logger');
 const { openCard } = require('../lib/card-vault');
@@ -39,6 +40,8 @@ const discoveryLimiter = rateLimit({
   keyGenerator: ipKey,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  handler: (_req, res) =>
+    sendProblem(res, 429, 'too_many_requests', 'Discovery rate limit exceeded. Retry in a minute.'),
 });
 
 const receiptLimiter = rateLimit({
@@ -48,10 +51,7 @@ const receiptLimiter = rateLimit({
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   handler: (_req, res) =>
-    res.status(429).json({
-      error: 'too_many_requests',
-      message: 'Receipt polling rate limit exceeded. Retry in a minute.',
-    }),
+    sendProblem(res, 429, 'too_many_requests', 'Receipt polling rate limit exceeded. Retry in a minute.'),
 });
 
 // Per-IP rate limit on challenge creation. An unauthenticated endpoint
@@ -72,10 +72,7 @@ const challengeLimiter = rateLimit({
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   handler: (_req, res) =>
-    res.status(429).json({
-      error: 'too_many_requests',
-      message: 'MPP challenge rate limit exceeded. Retry in a minute.',
-    }),
+    sendProblem(res, 429, 'too_many_requests', 'MPP challenge rate limit exceeded. Retry in a minute.'),
 });
 
 /**
@@ -124,10 +121,7 @@ function buildMppRouter(opts = {}) {
           status: v.status,
           reason: v.reason,
         });
-        return res.status(v.status).json({
-          error: v.reason,
-          ...(v.detail && { detail: v.detail }),
-        });
+        return sendProblem(res, v.status, v.reason, v.detail);
       }
       return handleDeliveryForVerdict(req, res, verdict);
     }
@@ -168,10 +162,12 @@ function buildMppRouter(opts = {}) {
   router.get('/mpp/receipts/:id', receiptLimiter, (req, res) => {
     const row = loadOrderByReceiptId(req.params.id);
     if (!row) {
-      return res.status(404).json({
-        error: 'receipt_not_found',
-        message: 'No receipt matches this id. It may have expired or never existed.',
-      });
+      return sendProblem(
+        res,
+        404,
+        'receipt_not_found',
+        'No receipt matches this id. It may have expired or never existed.',
+      );
     }
     if (row.status === 'delivered') {
       return res
@@ -186,12 +182,13 @@ function buildMppRouter(opts = {}) {
         });
     }
     if (row.status === 'failed') {
-      return res.status(502).json({
-        state: 'failed',
-        receipt_id: req.params.id,
-        order_id: row.id,
-        message: 'Fulfillment failed. Funds are being refunded to the sender address.',
-      });
+      return sendProblem(
+        res,
+        502,
+        'fulfillment_failed',
+        'Fulfillment failed. Funds are being refunded to the sender address.',
+        { state: 'failed', receipt_id: req.params.id, order_id: row.id },
+      );
     }
     return res.status(202).json({
       state: 'fulfilling',
@@ -226,12 +223,13 @@ async function handleDeliveryForVerdict(req, res, verdict) {
     });
   }
   if (result.state === 'failed') {
-    return res.status(502).json({
-      state: 'failed',
-      receipt_id: verdict.receiptId,
-      order_id: verdict.orderId,
-      message: 'Fulfillment failed. Funds are being refunded to the sender address.',
-    });
+    return sendProblem(
+      res,
+      502,
+      'fulfillment_failed',
+      'Fulfillment failed. Funds are being refunded to the sender address.',
+      { state: 'failed', receipt_id: verdict.receiptId, order_id: verdict.orderId },
+    );
   }
   // timeout — hand off to the receipt polling endpoint.
   const location = `/v1/mpp/receipts/${verdict.receiptId}`;

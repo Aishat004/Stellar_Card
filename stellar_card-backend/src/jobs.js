@@ -16,8 +16,6 @@ const {
   fireWebhook,
   getWebhookMaxAttempts,
   getWebhookRetryDelay,
-  MAX_WEBHOOK_ATTEMPTS,
-  DEFAULT_RETRY_CONFIG,
   refundOrQuarantine,
 } = require('./fulfillment');
 const vccClient = require('./vcc-client');
@@ -837,7 +835,6 @@ async function retryWebhooks() {
         // then abandoned.
         const delayMs =
           nextAttempts > getWebhookMaxAttempts() ? null : getWebhookRetryDelay(row.attempts);
-          nextAttempts > MAX_WEBHOOK_ATTEMPTS ? null : getWebhookRetryDelay(row.attempts, DEFAULT_RETRY_CONFIG);
         if (delayMs === null) {
           db.prepare(
             `
@@ -1463,6 +1460,61 @@ async function runDatabaseBackup() {
 
 // ── Interval registry ─────────────────────────────────────────────────────────
 
+// ── Nightly daily-stats job (issue #1008) ────────────────────────────────────
+//
+// Fires at 00:05 UTC every night, aggregates delivered orders for the
+// previous calendar day, and caches results in daily_stats via
+// stats.computeDailyStats(). The 5-minute offset avoids races with
+// midnight order-expiry and webhook-retry ticks.
+//
+// msUntilNext0005UTC computes the delay to the next 00:05 UTC so the
+// first setTimeout fires at the right wall-clock time regardless of when
+// the process starts.
+
+/**
+ * @param {number} [now]  Injected clock ms for tests.
+ * @returns {number}  Milliseconds until the next 00:05 UTC.
+ */
+function msUntilNext0005UTC(now = Date.now()) {
+  const d = new Date(now);
+  // Advance to tomorrow if we're already past 00:05 today.
+  const target = new Date(
+    Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 5, 0, 0),
+  );
+  if (target.getTime() <= now) target.setUTCDate(target.getUTCDate() + 1);
+  return target.getTime() - now;
+}
+
+async function runDailyStats() {
+  try {
+    const { computeDailyStats } = require('./lib/stats');
+    // Aggregate yesterday (the day that just finished at midnight).
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000)
+      .toISOString()
+      .slice(0, 10);
+    const result = computeDailyStats(yesterday);
+    log(
+      `daily-stats computed date=${result.date} orders=${result.total_orders} ` +
+        `volume=${result.total_volume} fees=${result.total_fees}`,
+    );
+  } catch (err) {
+    log(`daily-stats error: ${err instanceof Error ? err.message : String(err)}`);
+    reportSchedulerError(err, 'runDailyStats');
+  }
+}
+
+function scheduleDailyStats() {
+  const delay = msUntilNext0005UTC();
+  const t = setTimeout(async () => {
+    await runDailyStats();
+    // After the first fire, repeat every 24 h.
+    _jobIntervals.push(setInterval(runDailyStats, 24 * 60 * 60 * 1000));
+  }, delay);
+  // Store the initial timeout so stopJobs can cancel it if the process
+  // shuts down before it fires.
+  _jobIntervals.push(/** @type {any} */ (t));
+}
+
 // Track every interval scheduled by startJobs() so the process
 // signal handler in index.js can cancel them cleanly on SIGINT /
 // SIGTERM. Without this, pm2's graceful-stop sent SIGINT, Node
@@ -1504,6 +1556,10 @@ function startJobs() {
   // Daily database backup (#993). Runs immediately on startup then every 24 h.
   runDatabaseBackup();
   _jobIntervals.push(setInterval(() => { runDatabaseBackup(); }, BACKUP_INTERVAL_MS));
+
+  // Nightly daily-stats aggregation — runs at 00:05 UTC every day.
+  // Schedules itself to fire at the next 00:05 UTC and then every 24 h.
+  scheduleDailyStats();
 
   log('background jobs started');
 }
