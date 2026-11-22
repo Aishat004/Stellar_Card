@@ -8,6 +8,7 @@ const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs');
 const supertest = require('supertest');
 const appModule = require('../../src/app');
+const { generateApiKey, extractKeyPrefix } = require('../../src/lib/api-key');
 const db = require('../../src/db');
 
 const request = supertest(appModule);
@@ -24,15 +25,16 @@ async function createTestKey({
   expiresAt = null,
   enabled = 1,
 } = {}) {
-  const rawKey = `stellar_card_${crypto.randomBytes(24).toString('hex')}`;
+  // Use the production generator so the key carries the v2 checksum the
+  // auth middleware validates (see src/lib/api-key.js).
+  const rawKey = generateApiKey();
   // Low bcrypt cost (4) for fast tests
   const keyHash = await bcrypt.hash(rawKey, 4);
   const id = uuidv4();
   const webhookSecret = `whsec_${crypto.randomBytes(32).toString('hex')}`;
-  // Match production: src/api/dashboard.js:332 stores chars 9-21 as the
-  // prefix index so the auth middleware's O(1) lookup path fires in tests
-  // instead of falling back to the legacy NULL-prefix scan.
-  const keyPrefix = rawKey.slice(9, 21);
+  // Match production (src/api/dashboard.js) so the auth middleware's O(1)
+  // prefix lookup fires in tests instead of the legacy NULL-prefix scan.
+  const keyPrefix = extractKeyPrefix(rawKey);
 
   db.prepare(
     `
