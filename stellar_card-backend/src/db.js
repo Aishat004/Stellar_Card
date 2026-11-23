@@ -1050,7 +1050,7 @@ applyMigration(32, () => {
 
 // EXPECTED_SCHEMA_VERSION must match the last `applyMigration(N)` call
 // above. Bump it in lock-step with any new migration.
-const EXPECTED_SCHEMA_VERSION = 34;
+const EXPECTED_SCHEMA_VERSION = 35;
 const actualVersion = getSchemaVersion();
 if (actualVersion > EXPECTED_SCHEMA_VERSION) {
   console.error(
@@ -1192,6 +1192,31 @@ applyMigration(34, () => {
   } catch (e) {
     if (!e.message.includes('duplicate column')) throw e;
   }
+});
+
+// Migration 35: composite indexes on orders for status+created_at and
+// agent_id+created_at (#987).
+//
+// The existing single-column idx_orders_status and idx_orders_created_at
+// indexes cover point lookups and full-range scans individually, but
+// dashboard queries that filter by status AND sort/range by created_at
+// cannot satisfy both predicates from one b-tree pass. A composite index
+// on (status, created_at) lets the planner seek directly to the matching
+// status prefix and scan only the relevant created_at range — O(log N +
+// matching rows) rather than O(matching status rows) for the sort step.
+//
+// Similarly, queries that group or filter by agent_id and then sort by
+// created_at benefit from (agent_id, created_at): without it the planner
+// scans all orders for the agent and then sorts.
+//
+// IF NOT EXISTS makes this safe to re-run on databases that already have
+// the index (e.g. ones populated by a future migration that adds it
+// directly to the CREATE TABLE statement).
+applyMigration(35, () => {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_orders_status_created ON orders(status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_orders_agent_created  ON orders(agent_id, created_at);
+  `);
 });
 
 /**
